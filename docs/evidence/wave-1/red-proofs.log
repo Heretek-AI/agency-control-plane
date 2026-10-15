@@ -1,0 +1,137 @@
+# Wave 1 QA Red-Proof Log
+
+- Worktree: `/tmp/opencode/agency-control-plane-wave-1`
+- Branch: `wave-1-scheduler-limits`
+- Date (UTC): 2026-10-15
+- QA verdict: **PASS** (all acceptance checks green; every sabotage FAILs when
+  broken and PASSes when restored; worktree left clean, no commits made)
+
+## 1. Baseline: `make check` — EXIT 0
+
+```
+bun install v1.4.2 — Done! Checked 10 packages (no changes)
+bun run check
+$ bun run --filter './dispatcher' check && bun run --filter './web' check
+@heretek-ai/agency-dispatcher check: Exited with code 0
+@heretek-ai/agency-web check: agency-web: no sources yet / Exited with code 0
+bun test — bun test v1.4.2
+  34 pass, 0 fail, 63 expect() calls
+  Ran 34 tests across 2 files.
+```
+
+## 2. Baseline: `bash scripts/accept/wave-1.sh` — EXIT 0
+
+```
+[wave-1] bun install — ok
+[wave-1] typecheck dispatcher — @heretek-ai/agency-dispatcher check: Exited with code 0
+[wave-1] unit tests — 34 pass, 0 fail, 63 expect() calls
+[wave-1] zero-stub grep (must print nothing) — clean, no output
+[wave-1] required deliverables present — all 10 files found
+[wave-1] scheduler + limits behavior probe — behavior probe passed
+  (all_success ready, cascade cancel, overlap serialization,
+   tier-1 429 quota -> route-fallback, audit append + anchor)
+[wave-1] PASS
+```
+
+## 3. Zero-stub grep — CLEAN (empty)
+
+`grep -rniE 'TODO|FIXME|not implemented|placeholder' dispatcher/src
+dispatcher/test scripts/accept/wave-1.sh` printed nothing.
+
+## 4. Scope check — PASS
+
+- `git status --short` clean before and after every step (only untracked
+  `docs/evidence/wave-1/` added at the end).
+- Tracked new files live only under `dispatcher/`, `docs/`, `scripts/`,
+  `web/package.json` + `web/tsconfig.json` (workspace-required configs),
+  plus repo-root scaffolding from Wave 0 (`AGENTS.md`, `Makefile`,
+  `package.json`, `tsconfig.json`, `MASTER_BUILD_PROMPT.md` — pre-existing,
+  not added by Wave 1).
+- No SwarmOS code: the only `src/omni` hits are fixture path *strings*
+  (`"src/omni/*"`) inside `dispatcher/test/scheduler.test.ts` overlap tests
+  plus SPEC/verify-stage mentions — no `src/omni` directory, no
+  `swarmos-plugin.ts`, no AST parsers, no domain MCP tools.
+- `web/src` absent (correct for Wave 1).
+
+## 5. Sabotage A — `dispatcher/src/limits.ts` global-freeze regression — RED PROOF
+
+Asserted condition: 429/`gousagelimiterror` quota failure on
+`tier-1-opencode` returns `{ action: "route-fallback",
+targetTier: "tier-2-commercial" }` (ZERO mission pause).
+
+Sabotage diff (temporary, then reverted):
+```diff
+   if (isQuotaFailure(failure)) {
+     if (currentTier === "tier-1-opencode") {
+-      return { action: "route-fallback", targetTier: "tier-2-commercial" };
++      return { action: "pause-missions", reason: "SABOTAGE-A global freeze", resumeAfterMs: 60000 };
+     }
+```
+
+Failing proof — `bun test dispatcher/test/limits.test.ts` EXIT 1:
+```
+(fail) classifyProviderFailure quota failover > 429 gousagelimiterror on tier-1 routes to tier-2 with zero pause
+(fail) classifyProviderFailure quota failover > 402 routes tier-1 to tier-2 and tier-2 to tier-3
+(fail) classifyProviderFailure quota failover > freeusagelimiterror and credit-balance bodies count as quota
+ 12 pass, 3 fail, 28 expect() calls
+```
+Restore: `git checkout -- dispatcher/src/limits.ts` (printed `RESTORED-A`,
+`git status --short` clean).
+Restored proof — re-run EXIT 0: `15 pass, 0 fail, 30 expect() calls`.
+
+## 6. Sabotage B — `pathsOverlap` in `dispatcher/src/scheduler.ts` forced false — RED PROOF
+
+Asserted condition: two `expert-run` tasks with overlapping `input.paths`
+never start together (`blockedByOverlap` / `collidesSelected`).
+
+Sabotage diff (temporary, then reverted):
+```diff
+-export function pathsOverlap(a: Task, b: Task): boolean {
+-  if (a.kind !== "expert-run" || b.kind !== "expert-run") return false;
+-  return a.input.paths.some((pa) => b.input.paths.some((pb) => mayOverlap(pa, pb)));
++export function pathsOverlap(_a: Task, _b: Task): boolean {
++  return false; // SABOTAGE-B: overlap lock disabled
+ }
+```
+
+Failing proof — `bun test dispatcher/test/scheduler.test.ts` EXIT 1:
+```
+(fail) scheduler overlap serialization > pathsOverlap detects shared input paths
+(fail) scheduler overlap serialization > overlapping task blocked while the other runs (blockedByOverlap)
+(fail) scheduler overlap serialization > two overlapping candidates never start together (collidesSelected)
+ 16 pass, 3 fail
+```
+Restore: `git checkout -- dispatcher/src/scheduler.ts` (printed
+`RESTORED-B`, `git status --short` clean).
+Restored proof — re-run EXIT 0: `19 pass, 0 fail, 33 expect() calls`.
+
+## 7. Sabotage C — `dispatcher/src/audit.ts` hash-chain linkage broken — RED PROOF
+
+Asserted condition: `checkAnchor` replays the chain; any linkage break
+yields `ok: false` with a reason.
+
+Sabotage diff (temporary, then reverted):
+```diff
+-  const prevHash = records.length === 0 ? GENESIS_HASH : records[records.length - 1]!.hash;
++  const prevHash = GENESIS_HASH; // SABOTAGE-C: chain linkage broken
+```
+
+Failing proof — probe (append 2 records, then `checkAnchor`) EXIT 1:
+```
+anchor: {"ok":false,"records":2,"reason":"prevHash mismatch at seq 2"}
+PROBE: chain REJECTED: prevHash mismatch at seq 2
+```
+Restore: `git checkout -- dispatcher/src/audit.ts` (printed `RESTORED-C`,
+`git status --short` clean).
+Restored proof — same probe EXIT 0:
+```
+anchor: {"ok":true,"records":2}
+```
+
+## 8. Final state — GREEN + CLEAN
+
+- `bun test` EXIT 0: `34 pass, 0 fail, 63 expect() calls` (2 files).
+- `git status --short` output: empty — no modified tracked files; all three
+  sabotaged files restored byte-identical via `git checkout --`.
+- Only new untracked path: `docs/evidence/wave-1/red-proofs.log` (this file).
+- No commits made; no subagents spawned.
