@@ -1,0 +1,14 @@
+{
+  "name": "@heretek-ai/agency-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "bash -c 'shopt -s nullglob; files=(src/**/*.{ts,tsx} test/**/*.ts src/*.{ts,tsx} test/*.ts); if [ ${#files[@]} -eq 0 ]; then echo \"agency-web: no sources yet\"; exit 0; fi; exec tsc --noEmit'",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.4"
+  }
+}
