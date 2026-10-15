@@ -1,0 +1,11 @@
+{
+  "name": "@heretek-ai/agency-control-plane",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": ["dispatcher", "web"],
+  "scripts": {
+    "check": "bun run --filter './dispatcher' check && bun run --filter './web' check",
+    "accept": "bash scripts/accept/wave-1.sh && bash scripts/accept/wave-2.sh && bash scripts/accept/wave-3.sh",
+    "test": "bun test"
+  }
+}
