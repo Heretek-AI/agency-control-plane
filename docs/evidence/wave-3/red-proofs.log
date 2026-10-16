@@ -1,0 +1,115 @@
+# Wave 3 QA Red-Proof Sabotage Log
+
+- Stage: wave-3 (Unified High-Fidelity WebUI, 5 UX Pillars + Invariant I1)
+- Branch: `wave-3-webui`
+- Worktree: `/home/john/Projects/Heretek-AI-Rebuild/agency-control-plane-wave-3`
+- Date (UTC): 2026-10-16
+- QA Agent: agency-qa (Muse Spark 1.3 Contributor)
+
+## Acceptance baseline (all green before sabotage)
+
+- `bun install` → exit 0 (19 packages, no changes).
+- `bun run check` → exit 0 (dispatcher + web, zero errors/warnings).
+- `bun test` → 93 pass, 0 fail, 327 expect() calls across 6 files.
+- `bash scripts/accept/wave-3.sh` → exit 0 (`[wave-3] PASS`:
+  install, typecheck, tests, zero-stub grep clean, 16 deliverables
+  present, I1 static probe passed, behavior probe passed).
+- Regression: `bash scripts/accept/wave-1.sh` → exit 0 (`[wave-1] PASS`).
+- Regression: `bash scripts/accept/wave-2.sh` → exit 0 (`[wave-2] PASS`).
+- Zero-stub grep over `dispatcher web scripts` → no matches (clean).
+- Scope: `git diff --name-only main...HEAD -- dispatcher/` → empty
+  (dispatcher untouched by Wave 3); changed files only under `web/`,
+  `scripts/accept/`, `docs/reports/`, root `README.md`. No `src/omni`,
+  no `swarmos-plugin.ts`, no AST/MCP code.
+- Invariant I1 static gates: `grep -rni 'passphrase' web/src/state` →
+  clean; storage-access grep over `web/src` → clean; `data-*` secret
+  grep → clean; `approval-invariant.test.ts` 9/9 pass;
+  `ui-components.test.ts` 18/18 pass.
+
+---
+
+## Red-Proof A — passphrase leak in approval-client (Invariant I1)
+
+1. Condition asserted: `approval-client.ts` never touches browser
+   storage; `approval-invariant.test.ts` static probe
+   (`touchesStorage(code) === false`) plus runtime sign path must hold.
+2. Sabotage (minimal, targeted): inserted one line into
+   `approveWithSecret` in `web/src/security/approval-client.ts`,
+   immediately after `const keypair = deriveKeypairPem(secret);`:
+   `localStorage.setItem("approval-passphrase", secret);`
+3. Check run: `bun test web/test/approval-invariant.test.ts`
+   → exit 1 (FAIL, as required — non-vacuous):
+   `6 pass, 3 fail, 37 expect() calls`. Failing assertions:
+   - `(fail) invariant I1 (static source discipline) > approval-client
+     zeroes the closure secret and touches no storage`
+     (`expect(touchesStorage(code)).toBe(false)` → received true).
+   - Runtime sign tests threw `ReferenceError: localStorage is not
+     defined` at the planted line (proving the leak path executes).
+4. Revert: `git checkout -- web/src/security/approval-client.ts`
+   → `RESTORED A`.
+5. Clean check: `git status --short -- web/` → empty (clean).
+6. Restore proof: `bun test web/test/approval-invariant.test.ts`
+   → exit 0, `9 pass, 0 fail, 51 expect() calls`.
+
+## Red-Proof B — broken UI pillar (Kanban column removed)
+
+1. Condition asserted: `KanbanBoard` renders all five columns
+   (`Backlog`, `Ready`, `In Progress`, `Waiting Approval / QA`,
+   `Done`); `ui-components.test.ts` pillar-1 test asserts each
+   column marker is present.
+2. Sabotage (minimal, targeted): one-line change in
+   `web/src/components/KanbanBoard.tsx`:
+   `const columns = props.columns ?? BOARD_COLUMNS;` →
+   `const columns = props.columns ?? BOARD_COLUMNS.filter((column) => column !== "Done");`
+3. Check run: `bun test web/test/ui-components.test.ts`
+   → exit 1 (FAIL, as required — non-vacuous):
+   `17 pass, 1 fail, 81 expect() calls`. Failing assertion:
+   - `(fail) pillar 1: KanbanBoard > renders all five columns with
+     branch badges, path chips, and tier indicators`
+     (`expect(html.includes(column)).toBe(true)` fails on `Done`).
+4. Revert: `git checkout -- web/src/components/KanbanBoard.tsx`
+   → `RESTORED B`.
+5. Clean check: `git status --short -- web/` → empty (clean).
+6. Restore proof: `bun test web/test/ui-components.test.ts`
+   → exit 0, `18 pass, 0 fail, 91 expect() calls`.
+
+## Red-Proof C — broken SSE wiring (worker.tool topic dropped)
+
+1. Condition asserted: `applySsePayload` in `web/src/app.tsx` routes
+   `worker.tool` payloads into `store.appendToolEvent`;
+   `ui-components.test.ts` app-shell test asserts the tool stream
+   grows after a `worker.tool` payload.
+2. Sabotage (minimal, targeted): one-line change in
+   `web/src/app.tsx` `applySsePayload`:
+   `if ((topic === "worker.tool" || topic === "tool") && ...)` →
+   `if (topic === "tool" && ...)` (canonical `worker.tool` topic
+   no longer matched, silently ignored).
+3. Check run: `bun test web/test/ui-components.test.ts`
+   → exit 1 (FAIL, as required — non-vacuous):
+   `17 pass, 1 fail, 89 expect() calls`. Failing assertion:
+   - `(fail) app shell helpers > applySsePayload appends tool events
+     and follows tier fallback`.
+4. Revert: `git checkout -- web/src/app.tsx` → `RESTORED C`.
+5. Clean check: `git status --short -- web/` → empty (clean).
+6. Restore proof: `bun test web/test/ui-components.test.ts`
+   → exit 0, `18 pass, 0 fail, 91 expect() calls`.
+
+---
+
+## Final state
+
+- Post-sabotage full suite: `bun test` → 93 pass, 0 fail.
+- Post-sabotage accept: `bash scripts/accept/wave-3.sh` → `[wave-3] PASS`.
+- `git status --short` → completely clean (no uncommitted code or
+  test modifications); only this new file
+  `docs/evidence/wave-3/red-proofs.log` added.
+- No commits made; no subagents spawned. All sabotage edits reverted
+  via `git checkout -- <file>` immediately after each failing run.
+
+## QA verdict
+
+All three Wave 3 red-proofs demonstrate non-vacuous checks: each
+sabotage produced exit 1 with the expected failing test, and each
+restore returned the suite to green with a clean tree. Invariant I1,
+all five UX pillar renders, store transitions, and SSE wiring are
+empirically verified. Recommended: PASS (pending Drift Guard verdict).
