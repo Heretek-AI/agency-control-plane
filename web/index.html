@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Fleet Control Plane</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #0b0f17; color: #e8edf5; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import { App } from "/src/app.tsx";
+      import { createElement } from "react";
+      import { createRoot } from "react-dom/client";
+      const rootEl = document.getElementById("root");
+      if (rootEl !== null) {
+        createRoot(rootEl).render(createElement(App));
+      }
+    </script>
+    <noscript>Fleet Control Plane requires JavaScript.</noscript>
+  </body>
+</html>
