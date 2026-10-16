@@ -65,7 +65,8 @@ This repository is ONLY:
 - Do NOT copy `SwarmOS` (`src/omni`, `swarmos-plugin.ts`).
 - Do NOT implement AST parsers or domain MCP tools here.
 - Scope refusal check: any file outside `dispatcher/`, `web/`, `docs/`, `scripts/`,
-  repo-root configs (`package.json`, `tsconfig.json`, `Makefile`, `AGENTS.md`) is rejected.
+  `.github/` (CI workflows only), repo-root configs (`package.json`, `tsconfig.json`,
+  `Makefile`, `AGENTS.md`) is rejected.
 
 ## 5. Critical Bug Fixes Enforced (Reports `01b`, `04a`, `04b`)
 
@@ -95,6 +96,9 @@ This repository is ONLY:
 
 ```text
 agency-control-plane/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # make check + make accept on PRs and main
 ├── AGENTS.md
 ├── Makefile
 ├── package.json                    # Bun workspace root: ["dispatcher", "web"]
