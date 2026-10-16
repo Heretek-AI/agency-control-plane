@@ -34,10 +34,15 @@ export function natsUrlFromEnv(env: Record<string, string | undefined> = process
   return url !== undefined && url.trim().length > 0 ? url.trim() : null;
 }
 
-/** `NATS_URL` with any userinfo (user, password, token) replaced by `***`, for logs. */
+/**
+ * `NATS_URL` with any userinfo (user, password, token) replaced by `***`, for logs.
+ * When the URL has an `@` that a comma split cannot attribute to one server
+ * (e.g. a password containing `,`), it returns `<configured>` instead.
+ */
 export function redactNatsUrl(url: string): string {
-  return url
-    .split(",")
+  const servers = url.split(",");
+  if (url.includes("@") && servers.some((server) => !server.includes("@"))) return "<configured>";
+  return servers
     .map((server) => {
       const at = server.lastIndexOf("@");
       if (at === -1) return server;

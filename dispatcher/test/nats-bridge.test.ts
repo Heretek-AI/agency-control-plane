@@ -71,6 +71,8 @@ describe("nats bridge helpers", () => {
     expect(redactNatsUrl("nats://127.0.0.1:4222")).toBe("nats://127.0.0.1:4222");
     expect(redactNatsUrl("nats://user:s3cret@host:4222")).toBe("nats://***@host:4222");
     expect(redactNatsUrl("tok@host:4222,nats://a:b@other:4222")).toBe("***@host:4222,nats://***@other:4222");
+    // A comma inside the password leaves a fragment the split cannot attribute: log nothing of it.
+    expect(redactNatsUrl("nats://user:sec,ret@host:4222")).toBe("<configured>");
     expect(subjectFor("a b.*.>")).toBe("fleet.events.a_b._._");
   });
 
