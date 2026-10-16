@@ -179,7 +179,7 @@ describe("pillar 5: ApprovalDrawer", () => {
     const html = renderToStaticMarkup(
       createElement(ApprovalDrawer, {
         taskId: "task-104",
-        subjectHash: "abc123subject",
+        displayedSubjectHash: "abc123subject",
         additions: 10,
         deletions: 3,
         files: 2,
@@ -187,7 +187,20 @@ describe("pillar 5: ApprovalDrawer", () => {
           { suite: "qa-functional", status: "pass", detail: "12 tests green" },
           { suite: "qa-adversarial", status: "pending", detail: "awaiting red-team" },
         ],
-        ticket: "ticket-9",
+        ticket: {
+          ticket: "ticket-9",
+          taskId: "task-104",
+          subjectHash: "abc123subject",
+          timestamp: "2026-10-16T00:00:00.000Z",
+          expiresAtMs: 0,
+          keyFingerprint: "f".repeat(64),
+          publicKeyHex: "00",
+          payloads: {
+            approve: { runId: "task-104", stage: "APPROVE", subjectHash: "abc123subject", timestamp: "2026-10-16T00:00:00.000Z" },
+            reject: { runId: "task-104", stage: "REJECT", subjectHash: "abc123subject", timestamp: "2026-10-16T00:00:00.000Z" },
+          },
+          diff: { files: 2, additions: 10, deletions: 3 },
+        },
       }),
     );
     expect(html.includes("approval-drawer")).toBe(true);
@@ -198,6 +211,41 @@ describe("pillar 5: ApprovalDrawer", () => {
     expect(html.includes('type="password"')).toBe(true);
     expect(html.includes("approval-approve")).toBe(true);
     expect(html.includes("approval-reject")).toBe(true);
+    expect(html.includes("approval-key-file")).toBe(true);
+    expect(html.includes("matches the diff shown")).toBe(true);
+  });
+
+  test("without a ticket it offers minting; a mismatched subject warns and disables approve", () => {
+    const base = {
+      taskId: "task-104",
+      additions: 1,
+      deletions: 0,
+      files: 1,
+      verdicts: [],
+    };
+    const noTicket = renderToStaticMarkup(createElement(ApprovalDrawer, { ...base, displayedSubjectHash: "aa", ticket: null }));
+    expect(noTicket.includes("app-mint-ticket")).toBe(true);
+    expect(noTicket.includes("approval-secret")).toBe(false);
+    const payload = { runId: "task-104", stage: "APPROVE", subjectHash: "bb", timestamp: "t" };
+    const mismatch = renderToStaticMarkup(
+      createElement(ApprovalDrawer, {
+        ...base,
+        displayedSubjectHash: "aa",
+        ticket: {
+          ticket: "t",
+          taskId: "task-104",
+          subjectHash: "bb",
+          timestamp: "t",
+          expiresAtMs: 0,
+          keyFingerprint: "f".repeat(64),
+          publicKeyHex: "00",
+          payloads: { approve: payload, reject: { ...payload, stage: "REJECT" } },
+          diff: { files: 1, additions: 1, deletions: 0 },
+        },
+      }),
+    );
+    expect(mismatch.includes("does NOT match")).toBe(true);
+    expect(/data-testid="approval-approve"[^>]*disabled/.test(mismatch) || /disabled[^>]*data-testid="approval-approve"/.test(mismatch)).toBe(true);
   });
 });
 
@@ -327,11 +375,14 @@ describe("app shell helpers", () => {
   test("applySsePayload appends tool events and follows tier fallback", () => {
     const store = createFleetStore();
     store.setDrilldown(sampleWorker());
-    applySsePayload(store, { topic: "worker.tool", taskId: "task-103", tool: "grep", input: "q", output: "r" });
+    applySsePayload(store, { seq: 1, type: "worker.tool", data: { taskId: "task-103", tool: "grep", input: "q", output: "r" } });
     expect(store.getState().drilldown?.toolStream.length).toBe(2);
-    applySsePayload(store, { topic: "tier.fallback", targetTier: "tier-3-local" });
+    // Events for other tasks do not touch the open inspector.
+    applySsePayload(store, { seq: 2, type: "worker.tool", data: { taskId: "task-999", tool: "grep" } });
+    expect(store.getState().drilldown?.toolStream.length).toBe(2);
+    applySsePayload(store, { seq: 3, type: "tier.fallback", data: { targetTier: "tier-3-local" } });
     expect(store.getState().activeTier).toBe("tier-3-local");
-    applySsePayload(store, { topic: "unknown.noise" });
+    applySsePayload(store, { seq: 4, type: "unknown.noise", data: null });
     expect(store.getState().activeTier).toBe("tier-3-local");
   });
 });

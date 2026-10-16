@@ -1,11 +1,13 @@
 /**
  * Pillar 2 — persistent dockable Director chat sidebar.
  *
- * Conversation with the Top-Level Director Agent (`director`): an
- * append-only message list plus a compose box. Messages starting with
- * `/ship <spec>` open a mission charter preview with a 1-click DAG
- * injection button that decomposes the spec into task cards on the
- * Kanban board via `onInjectDag`. The sidebar stays mounted (dockable
+ * Conversation with the Director: a long-lived OpenCode session on the
+ * dispatcher (agent `director`). Free-form messages go to the Director,
+ * whose reply arrives over SSE; it creates task cards only through a
+ * validated ```tasks block (cards it created are listed under its reply).
+ * `/ship <spec>` is the explicit manual fallback: the charter preview
+ * shows the bullet decomposition and 1-click injection creates exactly
+ * those cards via the dispatcher. The sidebar stays mounted (dockable
  * left/right via the `dock` prop) so steering context is never lost.
  */
 import { useState } from "react";
@@ -16,6 +18,7 @@ export interface DirectorMessageView {
   author: string;
   text: string;
   timestamp: string;
+  tasksCreated?: string[] | undefined;
 }
 
 export interface DirectorChatProps {
@@ -38,14 +41,30 @@ export function parseShipCommand(text: string): string | null {
   return spec.length > 0 ? spec : null;
 }
 
+/** Text of a markdown bullet line (`- x`, `* x`, `1. x`), or null. Linear scan; mirrors the dispatcher. */
+export function bulletText(line: string): string | null {
+  const trimmed = line.trim();
+  let rest: string | null = null;
+  if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+    rest = trimmed.slice(2);
+  } else {
+    let digits = 0;
+    while (digits < trimmed.length && trimmed.charCodeAt(digits) >= 48 && trimmed.charCodeAt(digits) <= 57) digits += 1;
+    if (digits > 0 && trimmed[digits] === "." && (trimmed[digits + 1] === " " || trimmed[digits + 1] === "\t")) {
+      rest = trimmed.slice(digits + 2);
+    }
+  }
+  if (rest === null) return null;
+  const text = rest.trim();
+  return text.length > 0 ? text : null;
+}
+
 /** Decompose a charter spec into candidate task titles (bullets, else first line). */
 export function decomposeCharter(spec: string): string[] {
   const titles: string[] = [];
   for (const line of spec.split("\n")) {
-    const bullet = /^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$/.exec(line);
-    if (bullet !== null && bullet[1] !== undefined && bullet[1].length > 0) {
-      titles.push(bullet[1]);
-    }
+    const bullet = bulletText(line);
+    if (bullet !== null) titles.push(bullet);
   }
   if (titles.length > 0) return titles;
   const first = spec.split("\n")[0]?.trim() ?? "";
@@ -95,6 +114,11 @@ export function DirectorChat(props: DirectorChatProps): JSX.Element {
                 <strong style={{ color: palette.text }}>{message.author}</strong> · {message.timestamp}
               </div>
               <div style={{ fontSize: 14, whiteSpace: "pre-wrap" }}>{message.text}</div>
+              {message.tasksCreated !== undefined && message.tasksCreated.length > 0 ? (
+                <div data-testid={`director-cards-${message.seq}`} style={{ ...mutedStyle(), marginTop: 4 }}>
+                  cards: {message.tasksCreated.join(", ")}
+                </div>
+              ) : null}
             </li>
           ))
         )}

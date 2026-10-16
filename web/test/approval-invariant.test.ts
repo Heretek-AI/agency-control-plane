@@ -8,14 +8,21 @@
  * runtime (mocked `fetch` + `assertNoPassphraseLeak` over every
  * observable sink). No network, no DOM required.
  */
-import { readFileSync } from "node:fs";
+import { generateKeyPairSync } from "node:crypto";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { sealHumanKey, unsealHumanKey } from "../../dispatcher/src/human-key.js";
+import { createServer, type FleetServer } from "../../dispatcher/src/server.js";
 import {
   activeApprovalSecrets,
-  approveOneClick,
-  approveWithPassphrase,
+  approveWithKeyFile,
   assertNoPassphraseLeak,
+  canonicalApprovalPayload,
+  keyFileNeedsPassphrase,
+  subjectHashForHunks,
+  type ApprovalTicketView,
   type FetchLike,
 } from "../src/security/approval-client.js";
 import { createFleetStore } from "../src/state/fleet-store.js";
@@ -72,88 +79,136 @@ describe("invariant I1 (static source discipline)", () => {
   test("approval-client zeroes the closure secret and touches no storage", () => {
     const code = stripComments(readSource(join("security", "approval-client.ts")));
     expect(touchesStorage(code)).toBe(false);
+    expect(code.includes("fill(0)")).toBe(true);
     expect(code.includes("finally")).toBe(true);
     expect(code.includes("secret = null")).toBe(true);
     expect(code.includes('secret = ""')).toBe(true);
     expect(code.includes("liveSecrets")).toBe(true);
   });
+
+  test("browser code never imports Node built-ins or uses Buffer", () => {
+    const files = ["app.tsx", "main.tsx", join("security", "approval-client.ts"), join("state", "fleet-store.ts")];
+    for (const file of files) {
+      const code = stripComments(readSource(file));
+      expect(/from\s+["']node:/.test(code), `${file} imports node:*`).toBe(false);
+      expect(/\bBuffer\b/.test(code), `${file} uses Buffer`).toBe(false);
+    }
+  });
 });
 
-function mockSignFetch(taskId: string, subjectHash: string, capture: { body: string; url: string }): FetchLike {
-  return async (input: string, init?: { body?: string | undefined }): Promise<Response> => {
-    capture.url = String(input);
-    capture.body = typeof init?.body === "string" ? init.body : "";
-    return new Response(JSON.stringify({ taskId, status: "ready", subjectHash }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+const PASSPHRASE = "correct horse battery staple 101";
+
+const HUNKS = [
+  { file: "a.ts", status: "modified" as const, additions: 1, deletions: 1, patch: "diff --git a/a.ts b/a.ts\n-x\n+y\n" },
+];
+
+/** A dispatcher with a pinned human key and one task waiting for approval. */
+function dispatcher(): { app: FleetServer; sealed: Uint8Array; stateDir: string } {
+  const stateDir = mkdtempSync(join(tmpdir(), "web-approval-"));
+  sealHumanKey(stateDir, PASSPHRASE);
+  const app = createServer({ stateDir });
+  app.upsertTask({ id: "task-101", status: "waitingHuman", title: "Human gate" });
+  app.recordDiff("task-101", HUNKS);
+  return { app, sealed: new Uint8Array(readFileSync(join(stateDir, "human.key.enc"))), stateDir };
+}
+
+/** Route the client's relative fetches into the in-process dispatcher, recording bodies. */
+function routed(app: FleetServer, bodies: string[]): FetchLike {
+  return async (url, init) => {
+    bodies.push(init?.body ?? "");
+    return app.fetch(
+      new Request(`http://127.0.0.1${url}`, {
+        method: init?.method ?? "GET",
+        headers: { ...(init?.headers ?? {}), "x-csrf-token": app.csrfToken },
+        ...(init?.body !== undefined ? { body: init.body } : {}),
+      }),
+    );
   };
 }
 
-describe("invariant I1 (runtime behavior)", () => {
-  test("passphrase approval sends only signature + public key, then zeroes the closure", async () => {
-    const secret = "correct horse battery staple 101";
-    const capture = { body: "", url: "" };
-    const result = await approveWithPassphrase("task-101", "ticket-1", secret, "subject-hash-1", {
-      fetchImpl: mockSignFetch("task-101", "subject-hash-1", capture),
+async function mint(app: FleetServer): Promise<ApprovalTicketView> {
+  const res = await app.fetch(
+    new Request("http://127.0.0.1/api/approvals/task-101/ticket", { method: "POST", headers: { "x-csrf-token": app.csrfToken }, body: "{}" }),
+  );
+  expect(res.status).toBe(200);
+  return (await res.json()) as ApprovalTicketView;
+}
+
+describe("invariant I1 + browser signing (runtime, against a real dispatcher)", () => {
+  test("sealed human.key.enc + passphrase: WebCrypto signature verifies on the pinned key; only the signature is sent", async () => {
+    const { app, sealed } = dispatcher();
+    const ticket = await mint(app);
+    expect(await subjectHashForHunks(HUNKS)).toBe(ticket.subjectHash);
+    expect(keyFileNeedsPassphrase(sealed)).toBe(true);
+    const keyBytes = new Uint8Array(sealed);
+    const bodies: string[] = [];
+    const result = await approveWithKeyFile("task-101", ticket, keyBytes, PASSPHRASE, {
+      fetchImpl: routed(app, bodies),
+      expectedSubjectHash: await subjectHashForHunks(HUNKS),
     });
-    expect(result.status).toBe("ready");
-    expect(capture.url).toBe("/api/approvals/task-101/sign");
-    expect(capture.body.includes(secret)).toBe(false);
-    expect(capture.body.includes("passphrase")).toBe(false);
-    const body = JSON.parse(capture.body) as Record<string, unknown>;
-    expect(typeof body["signature"]).toBe("string");
-    expect(typeof body["publicKey"]).toBe("string");
-    expect("passphrase" in body || "secret" in body).toBe(false);
+    expect(result.status).toBe("done");
+    expect(app.getTask("task-101")?.status).toBe("done");
+    const wire = bodies.join("\n");
+    expect(wire.includes(PASSPHRASE)).toBe(false);
+    const body = JSON.parse(bodies[0] ?? "{}") as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["approve", "signatureHex", "subjectHash", "ticket"]);
+    // The key-file buffer handed to the client is zeroed afterwards.
+    expect(keyBytes.every((byte) => byte === 0)).toBe(true);
     expect(activeApprovalSecrets()).toBe(0);
+    await app.shutdown();
   });
 
-  test("one-click approval involves no human secret at all", async () => {
-    const capture = { body: "", url: "" };
-    const result = await approveOneClick(
-      "task-102",
-      "ticket-2",
-      "subject-hash-2",
-      { signature: "ab".repeat(64), publicKey: "fake-public-key" },
-      { fetchImpl: mockSignFetch("task-102", "subject-hash-2", capture) },
-    );
-    expect(result.taskId).toBe("task-102");
-    expect(activeApprovalSecrets()).toBe(0);
+  test("unencrypted PKCS#8 PEM of the human key also signs", async () => {
+    const { app, stateDir } = dispatcher();
+    const der = unsealHumanKey(stateDir, PASSPHRASE);
+    const pem = `-----BEGIN PRIVATE KEY-----\n${der.toString("base64")}\n-----END PRIVATE KEY-----\n`;
+    const ticket = await mint(app);
+    const result = await approveWithKeyFile("task-101", ticket, new TextEncoder().encode(pem), "", {
+      fetchImpl: routed(app, []),
+      approve: false,
+    });
+    expect(result.status).toBe("failed");
+    await app.shutdown();
   });
 
-  test("empty passphrase is rejected fail-closed without any network call", async () => {
-    let calls = 0;
-    const counting: FetchLike = async (): Promise<Response> => {
-      calls += 1;
-      return new Response("{}", { status: 200 });
-    };
-    let message = "";
-    try {
-      await approveWithPassphrase("task-103", "ticket-3", "", "subject-hash-3", { fetchImpl: counting });
-    } catch (err) {
-      message = (err as Error).message;
-    }
-    expect(message.length > 0).toBe(true);
-    expect(calls).toBe(0);
+  test("wrong passphrase, foreign key, and mismatched displayed diff fail locally without a request", async () => {
+    const { app, sealed } = dispatcher();
+    const ticket = await mint(app);
+    const bodies: string[] = [];
+    const fetchImpl = routed(app, bodies);
+    await expect(approveWithKeyFile("task-101", ticket, new Uint8Array(sealed), "wrong passphrase", { fetchImpl })).rejects.toThrow(/wrong passphrase/);
+    const foreign = generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+    await expect(approveWithKeyFile("task-101", ticket, new TextEncoder().encode(foreign), "", { fetchImpl })).rejects.toThrow(/not the dispatcher's pinned human key/);
+    await expect(
+      approveWithKeyFile("task-101", ticket, new Uint8Array(sealed), PASSPHRASE, { fetchImpl, expectedSubjectHash: "0".repeat(64) }),
+    ).rejects.toThrow(/does not hash/);
+    await expect(approveWithKeyFile("task-101", ticket, new Uint8Array(sealed), "", { fetchImpl })).rejects.toThrow(/needs its passphrase/);
+    expect(bodies).toEqual([]);
     expect(activeApprovalSecrets()).toBe(0);
+    expect(app.getTask("task-101")?.status).toBe("waitingHuman");
+    await app.shutdown();
+  });
+
+  test("canonical payload matches the dispatcher byte for byte", async () => {
+    const { canonicalApprovalPayload: serverCanonical } = await import("../../dispatcher/src/human-key.js");
+    const payload = { runId: "task-1", stage: "APPROVE", subjectHash: "a\"b", timestamp: "2026-10-16T00:00:00.000Z" };
+    expect(canonicalApprovalPayload(payload)).toBe(serverCanonical(payload));
   });
 
   test("assertNoPassphraseLeak passes on a clean post-approval snapshot", async () => {
-    const secret = "s3cr3t-closure-only-404";
-    const capture = { body: "", url: "" };
-    await approveWithPassphrase("task-104", "ticket-4", secret, "subject-hash-4", {
-      fetchImpl: mockSignFetch("task-104", "subject-hash-4", capture),
-    });
+    const { app, sealed } = dispatcher();
+    const ticket = await mint(app);
+    await approveWithKeyFile("task-101", ticket, new Uint8Array(sealed), PASSPHRASE, { fetchImpl: routed(app, []) });
     const store = createFleetStore();
     store.upsertTask({
-      id: "task-104",
+      id: "task-101",
       title: "Human gate",
-      branch: "fleet/task-104",
+      branch: "fleet/task-101",
       ownedPaths: ["dispatcher/src"],
       tier: "tier-1-opencode",
-      column: "Waiting Approval / QA",
+      column: "Done",
     });
-    const probe = assertNoPassphraseLeak(secret, {
+    const probe = assertNoPassphraseLeak(PASSPHRASE, {
       storeSnapshot: store.getState(),
       domHtml: `<section data-testid="approval-drawer"><input type="password" id="approval-secret" /></section>`,
       localStorageDump: {},
@@ -161,6 +216,7 @@ describe("invariant I1 (runtime behavior)", () => {
     });
     expect(probe.ok).toBe(true);
     expect(probe.findings).toEqual([]);
+    await app.shutdown();
   });
 
   test("assertNoPassphraseLeak is sensitive: a planted leak in any sink fails the probe", () => {
