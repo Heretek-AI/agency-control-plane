@@ -169,11 +169,17 @@ export interface WorkerProcess {
 
 const LISTEN_PATTERNS: readonly RegExp[] = [/listening on (https?:\/\/\S+)/i, /"url"\s*:\s*"(https?:\/\/[^"]+)"/];
 
+function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === "/") end--;
+  return value.slice(0, end);
+}
+
 /** Extract the listening URL from one stdout line, or null. */
 export function parseListeningUrl(line: string): string | null {
   for (const pattern of LISTEN_PATTERNS) {
     const match = pattern.exec(line);
-    if (match !== null && match[1] !== undefined) return match[1].replace(/\/+$/, "");
+    if (match !== null && match[1] !== undefined) return stripTrailingSlashes(match[1]);
   }
   return null;
 }
