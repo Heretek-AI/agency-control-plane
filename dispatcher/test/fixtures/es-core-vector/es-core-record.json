@@ -1,0 +1,9 @@
+{
+  "runId": "run-vector-1",
+  "stage": "TRUST",
+  "subjectHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "timestamp": "2026-10-16T00:00:00.000Z",
+  "publicKeyHex": "302a300506032b6570032100e818c52722e18d077c31a01ca58ebbcd37f69e5a869b79e45906c90d097fb203",
+  "fingerprint": "27c68f58ad4ba691ecb37b23151cc322bedac501212aa1ee2adf81c207ec98a1",
+  "signatureHex": "56f4a0fc130427355b3d71d49ff5b48e401d66bbfb17eaa070aaa4f271255a842ce4013ab9afeab55dd1f7f5cb3dbbf89baedff03f8d07c9092a6a562e3f9c00"
+}

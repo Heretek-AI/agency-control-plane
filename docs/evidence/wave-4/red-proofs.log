@@ -1,0 +1,10 @@
+# Red proof: re-enable client-supplied public keys in POST /api/approvals/:taskId/sign
+# sabotage: verify against body.publicKeyHex when present (2026-10-16T19:29:30Z)
+Expected: 403
+Received: 200
+(fail) approval attacks (each must be refused and leave the task waitingHuman) > client-supplied publicKey / publicKeyHex / fingerprint are ignored [75.11ms]
+ 12 pass
+ 1 fail
+# restored (cp of pre-sabotage server.ts)
+ 13 pass
+ 0 fail

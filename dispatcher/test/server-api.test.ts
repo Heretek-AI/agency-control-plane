@@ -1,15 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  generateApprovalKeyPair,
-  hashSubject,
-  passphraseToKeypair,
-  signSubjectHash,
-  TicketStore,
-  verifyApprovalSignature,
-} from "../src/approval-tickets.js";
+import { hashSubject, TicketStore } from "../src/approval-tickets.js";
 import { checkAnchor } from "../src/audit.js";
 import { createServer, type BoardView, type FleetServer } from "../src/server.js";
 
@@ -108,11 +101,11 @@ describe("loopback and CSRF guards", () => {
 });
 
 describe("POST /api/director/message", () => {
-  test("bullets decompose into task cards and audit records the message", async () => {
+  test("/ship bullets decompose into task cards and audit records the message", async () => {
     const auditLogPath = scratchAudit();
     const app = createServer({ auditLogPath });
     const res = await app.fetch(
-      authed("/api/director/message", { message: "Ship search\n- index builder\n- query api" }, app.csrfToken),
+      authed("/api/director/message", { message: "/ship Ship search\n- index builder\n- query api" }, app.csrfToken),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { tasksCreated: string[] };
@@ -123,6 +116,13 @@ describe("POST /api/director/message", () => {
     const anchor = checkAnchor(auditLogPath);
     expect(anchor.ok).toBe(true);
     expect(anchor.records).toBe(1);
+  });
+
+  test("free-form messages need a Director worker: 503 without one, no cards created", async () => {
+    const app = createServer({ auditLogPath: scratchAudit() });
+    const res = await app.fetch(authed("/api/director/message", { message: "- looks like a bullet" }, app.csrfToken));
+    expect(res.status).toBe(503);
+    expect(app.getBoard().tasks).toHaveLength(0);
   });
 
   test("empty messages are rejected", async () => {
@@ -172,7 +172,9 @@ describe("approval tickets: single-use + TTL", () => {
     const store = new TicketStore();
     const subject = hashSubject("diff summary + qa verdicts");
     const { token } = store.mintTicket("task-1", subject);
-    expect(store.verifyTicket(token)).toEqual({ taskId: "task-1", subjectHash: subject });
+    const binding = store.verifyTicket(token);
+    expect(binding.taskId).toBe("task-1");
+    expect(binding.subjectHash).toBe(subject);
     expect(() => store.verifyTicket(token)).toThrow(/already been used/);
   });
 
@@ -191,157 +193,6 @@ describe("approval tickets: single-use + TTL", () => {
     expect(() => store.redeemTicket(token, "task-2", "hash-1")).toThrow(/bound to task/);
     // The mismatched ticket is burned: it cannot be retried.
     expect(() => store.redeemTicket(token, "task-1", "hash-1")).toThrow(/already been used/);
-  });
-
-  test("Ed25519 round-trip verifies, tampered signatures do not", () => {
-    const keys = generateApprovalKeyPair();
-    const subject = hashSubject("approve me");
-    const signature = signSubjectHash(keys.privateKeyPem, subject);
-    expect(verifyApprovalSignature(keys.publicKeyPem, subject, signature)).toBe(true);
-    expect(verifyApprovalSignature(keys.publicKeyPem, `${subject}tampered`, signature)).toBe(false);
-    expect(verifyApprovalSignature(keys.publicKeyPem, subject, "zz")).toBe(false);
-    const passKeys = passphraseToKeypair("correct horse");
-    const passSig = signSubjectHash(passKeys.privateKeyPem, subject);
-    expect(verifyApprovalSignature(passKeys.publicKeyPem, subject, passSig)).toBe(true);
-    const wrongKeys = passphraseToKeypair("wrong horse");
-    expect(verifyApprovalSignature(wrongKeys.publicKeyPem, subject, passSig)).toBe(false);
-  });
-});
-
-describe("POST /api/approvals/:taskId/ticket + /sign", () => {
-  async function approvedSetup(): Promise<{ app: FleetServer; subject: string }> {
-    const app = createServer({ auditLogPath: scratchAudit() });
-    app.upsertTask({ id: "task-h", status: "waitingHuman", title: "Needs human" });
-    const subject = hashSubject("diff for task-h");
-    return { app, subject };
-  }
-
-  test("Ed25519 keypair approval transitions waitingHuman to ready", async () => {
-    const { app, subject } = await approvedSetup();
-    const minted = await app.fetch(authed("/api/approvals/task-h/ticket", { subjectHash: subject }, app.csrfToken));
-    expect(minted.status).toBe(200);
-    const { ticket } = (await minted.json()) as { ticket: string };
-    const keys = generateApprovalKeyPair();
-    const signature = signSubjectHash(keys.privateKeyPem, subject);
-    const signed = await app.fetch(
-      authed(
-        "/api/approvals/task-h/sign",
-        { ticket, subjectHash: subject, signature, publicKey: keys.publicKeyPem },
-        app.csrfToken,
-      ),
-    );
-    expect(signed.status).toBe(200);
-    const body = (await signed.json()) as { status: string };
-    expect(body.status).toBe("ready");
-    expect(app.getTask("task-h")?.status).toBe("ready");
-    // The ticket is single-use: replaying it fails.
-    const replay = await app.fetch(
-      authed(
-        "/api/approvals/task-h/sign",
-        { ticket, subjectHash: subject, signature, publicKey: keys.publicKeyPem },
-        app.csrfToken,
-      ),
-    );
-    expect(replay.status).toBe(403);
-  });
-
-  test("passphrase-derived approval verifies without a stored secret", async () => {
-    const { app, subject } = await approvedSetup();
-    const minted = await app.fetch(authed("/api/approvals/task-h/ticket", { subjectHash: subject }, app.csrfToken));
-    const { ticket } = (await minted.json()) as { ticket: string };
-    const keys = passphraseToKeypair("human passphrase");
-    const signature = signSubjectHash(keys.privateKeyPem, subject);
-    const signed = await app.fetch(
-      authed("/api/approvals/task-h/sign", { ticket, subjectHash: subject, signature, passphrase: "human passphrase" }, app.csrfToken),
-    );
-    expect(signed.status).toBe(200);
-    expect(app.getTask("task-h")?.status).toBe("ready");
-  });
-
-  test("wrong passphrase, bad signature, and binding mismatch are rejected", async () => {
-    const { app, subject } = await approvedSetup();
-    app.upsertTask({ id: "task-other", status: "waitingHuman", title: "Other" });
-    const minted = await app.fetch(authed("/api/approvals/task-h/ticket", { subjectHash: subject }, app.csrfToken));
-    const { ticket } = (await minted.json()) as { ticket: string };
-    const keys = passphraseToKeypair("human passphrase");
-    const signature = signSubjectHash(keys.privateKeyPem, subject);
-
-    const wrongPass = await app.fetch(
-      authed(
-        "/api/approvals/task-h/ticket",
-        { subjectHash: subject },
-        app.csrfToken,
-      ),
-    );
-    expect(wrongPass.status).toBe(200);
-    const fresh = (await wrongPass.json()) as { ticket: string };
-    const badPass = await app.fetch(
-      authed(
-        "/api/approvals/task-h/sign",
-        { ticket: fresh.ticket, subjectHash: subject, signature, passphrase: "wrong passphrase" },
-        app.csrfToken,
-      ),
-    );
-    expect(badPass.status).toBe(403);
-
-    const crossTask = await app.fetch(
-      authed(
-        "/api/approvals/task-other/sign",
-        { ticket, subjectHash: subject, signature, publicKey: keys.publicKeyPem },
-        app.csrfToken,
-      ),
-    );
-    expect(crossTask.status).toBe(403);
-  });
-
-  test("signing a task that is not waitingHuman fails with 409", async () => {
-    const app = createServer({ auditLogPath: scratchAudit() });
-    app.upsertTask({ id: "task-r", status: "running", title: "Running" });
-    const subject = hashSubject("x");
-    const minted = await app.fetch(authed("/api/approvals/task-r/ticket", { subjectHash: subject }, app.csrfToken));
-    const { ticket } = (await minted.json()) as { ticket: string };
-    const keys = generateApprovalKeyPair();
-    const res = await app.fetch(
-      authed(
-        "/api/approvals/task-r/sign",
-        { ticket, subjectHash: subject, signature: signSubjectHash(keys.privateKeyPem, subject), publicKey: keys.publicKeyPem },
-        app.csrfToken,
-      ),
-    );
-    expect(res.status).toBe(409);
-  });
-
-  test("rejection returns the task to pending and the audit ledger chains", async () => {
-    const auditLogPath = scratchAudit();
-    const app = createServer({ auditLogPath });
-    app.upsertTask({ id: "task-j", status: "waitingHuman", title: "Judge me" });
-    const subject = hashSubject("judge");
-    const minted = await app.fetch(authed("/api/approvals/task-j/ticket", { subjectHash: subject }, app.csrfToken));
-    const { ticket } = (await minted.json()) as { ticket: string };
-    const keys = generateApprovalKeyPair();
-    const res = await app.fetch(
-      authed(
-        "/api/approvals/task-j/sign",
-        {
-          ticket,
-          subjectHash: subject,
-          signature: signSubjectHash(keys.privateKeyPem, subject),
-          publicKey: keys.publicKeyPem,
-          approve: false,
-        },
-        app.csrfToken,
-      ),
-    );
-    expect(res.status).toBe(200);
-    expect(app.getTask("task-j")?.status).toBe("pending");
-    const anchor = checkAnchor(auditLogPath);
-    expect(anchor.ok).toBe(true);
-    expect(anchor.records).toBe(2);
-    const events = readFileSync(auditLogPath, "utf8")
-      .split("\n")
-      .filter((line) => line.length > 0)
-      .map((line) => (JSON.parse(line) as { event: string }).event);
-    expect(events).toEqual(["approval.ticket-minted", "approval.signed"]);
   });
 });
 
@@ -392,5 +243,46 @@ describe("GET /api/events SSE", () => {
     await reader.cancel();
     expect(received).toContain('"index":1');
     expect(received).toContain('"index":2');
+  });
+});
+
+describe("input parsing hardening", () => {
+  test("bulletText parses bullets linearly and rejects non-bullets", async () => {
+    const { bulletText } = await import("../src/server.js");
+    expect(bulletText("  - alpha  ")).toBe("alpha");
+    expect(bulletText("* beta")).toBe("beta");
+    expect(bulletText("12. gamma")).toBe("gamma");
+    expect(bulletText("12.gamma")).toBeNull();
+    expect(bulletText("-nope")).toBeNull();
+    expect(bulletText("- ")).toBeNull();
+    const started = Date.now();
+    bulletText(`- ${" ".repeat(200_000)}x${" ".repeat(200_000)}`);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test("tasks fences are extracted without regex backtracking", async () => {
+    const { extractTaskBlocks } = await import("../src/director.js");
+    expect(extractTaskBlocks('a\n```tasks\n[1]\n```\nb')).toEqual({ blocks: ["[1]"], text: "a\n\nb" });
+    expect(extractTaskBlocks("```tasks extra\n[1]\n```").blocks).toEqual([]);
+    const started = Date.now();
+    extractTaskBlocks(`\`\`\`tasks\n${"\n".repeat(200_000)}`);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test("static serving refuses paths outside web/dist", async () => {
+    const { mkdtempSync: mk, writeFileSync } = await import("node:fs");
+    const dist = mk(join(tmpdir(), "dist-"));
+    writeFileSync(join(dist, "index.html"), "<!doctype html><title>x</title>");
+    const app = createServer({ auditLogPath: scratchAudit(), webDistDir: dist });
+    const index = await app.fetch(new Request("http://127.0.0.1/"));
+    expect(index.status).toBe(200);
+    expect(index.headers.get("content-security-policy")).toContain("default-src 'self'");
+    const dotted = await app.fetch(new Request("http://127.0.0.1/%2e%2e/%2e%2e/etc/passwd"));
+    expect(await dotted.text()).not.toContain("root:");
+    const { serveStatic } = await import("../src/server.js");
+    expect(serveStatic(dist, "/../../etc/passwd")).toBeNull();
+    expect(serveStatic(dist, "/..%2f..%2fetc%2fpasswd")).toBeNull();
+    expect((await app.fetch(new Request("http://127.0.0.1/missing.js"))).status).toBe(404);
+    expect((await app.fetch(new Request("http://127.0.0.1/some/route"))).status).toBe(200);
   });
 });
