@@ -1,7 +1,7 @@
-.PHONY: check accept accept-1 accept-2 accept-3 install typecheck test
+.PHONY: check accept accept-1 accept-2 accept-3 accept-4 install typecheck test build-web e2e-ui serve
 
 install:
-	bun install
+	bun install --frozen-lockfile --ignore-scripts
 
 typecheck:
 	bun run check
@@ -20,4 +20,16 @@ accept-2:
 accept-3:
 	bash scripts/accept/wave-3.sh
 
-accept: accept-1 accept-2 accept-3
+accept-4:
+	bash scripts/accept/wave-4.sh
+
+build-web:
+	bun run build:web
+
+e2e-ui: build-web
+	bun run e2e:ui
+
+serve:
+	bun run serve
+
+accept: accept-1 accept-2 accept-3 accept-4

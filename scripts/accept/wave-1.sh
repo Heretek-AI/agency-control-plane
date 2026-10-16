@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 echo "[wave-1] bun install"
-bun install
+bun install --frozen-lockfile --ignore-scripts
 
 echo "[wave-1] typecheck dispatcher"
 bun run --filter './dispatcher' check
