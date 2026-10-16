@@ -933,6 +933,13 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
       const created = parsed.tasks.length > 0 ? createDirectorTasks(parsed.tasks, missionId) : [];
       const reply = appendMessage("director", parsed.text.length > 0 ? parsed.text : "(tasks only)", created);
       audit("director.reply", { seq: reply.seq, replyTo: message.seq, missionId, tasksCreated: created });
+    }).catch((err: unknown) => {
+      try {
+        appendMessage("system", `Director reply could not be applied: ${(err as Error).message}`);
+        audit("director.reply-failed", { replyTo: message.seq, error: (err as Error).message });
+      } catch {
+        // store closed during shutdown
+      }
     });
     return json({ message, pending: true }, 202);
   }

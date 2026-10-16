@@ -57,10 +57,11 @@ const server = startServer({
   workers: { command: fake, startTimeoutMs: 20_000 },
   director: { command: fake, startTimeoutMs: 20_000 },
 });
-const browser = await chromium.launch();
 const problems: string[] = [];
 let failed = false;
+let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 try {
+  browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   page.on("console", (message) => {
     if (message.type() === "error") problems.push(`console.error: ${message.text()}`);
@@ -120,7 +121,7 @@ try {
   failed = true;
   problems.push(`step failed: ${(err as Error).message}`);
 } finally {
-  await browser.close();
+  await browser?.close();
   await server.stop();
 }
 if (failed || problems.length > 0) {

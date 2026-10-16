@@ -33,7 +33,7 @@ async function readPassphrase(prompt: string): Promise<string> {
 }
 
 async function main(): Promise<void> {
-  const { flags, switches } = parseArgs(process.argv.slice(2));
+  const { flags, switches } = parseArgs(process.argv.slice(2), new Set(["force"]));
   const out = resolve(flags.get("out") ?? process.env["FLEET_STATE_DIR"] ?? join(homedir(), ".local", "state", "agency-control-plane"));
   if (existsSync(join(out, "human.pub")) && !switches.has("force")) {
     throw new Error(`${join(out, "human.pub")} already exists; pass --force to replace the human key`);

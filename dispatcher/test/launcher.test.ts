@@ -12,6 +12,7 @@ import { parseDirectorReply } from "../src/director.js";
 import { parseListeningUrl, parseSseFrame, spawnWorker } from "../src/opencode-client.js";
 import { createServer, type CreateServerOptions, type FleetServer } from "../src/server.js";
 import { taskPrompt } from "../src/worker-launcher.js";
+import { runTurn, type WorkerConnection } from "../src/worker-session.js";
 
 const FAKE = join(import.meta.dir, "fixtures", "fake-opencode.ts");
 const FAKE_COMMAND = [process.execPath, FAKE, "serve", "--port", "0", "--hostname", "127.0.0.1"];
@@ -78,6 +79,19 @@ describe("worker protocol helpers", () => {
     await expect(
       spawnWorker({ command: [process.execPath, "-e", "console.log('nope'); process.exit(3)"], cwd: stateDir, stateDir, startTimeoutMs: 5000 }),
     ).rejects.toThrow(/exited with code 3/);
+  });
+
+  test("a prompt admission that never answers still ends the turn at its timeout", async () => {
+    const never = new Promise<never>(() => undefined);
+    const conn = {
+      proc: { exited: never, tail: () => "" },
+      client: { prompt: () => never },
+      listen: () => () => undefined,
+      alive: () => true,
+      close: async () => undefined,
+    } as unknown as WorkerConnection;
+    const result = await runTurn(conn, "sess-1", "hi", { timeoutMs: 50 });
+    expect(result.outcome).toBe("timeout");
   });
 
   test("task prompt carries objective, acceptance and owned paths", () => {
@@ -261,6 +275,17 @@ describe("Director session (fake opencode serve)", () => {
     expect(parseDirectorReply("```tasks\n{not json}\n```").ok).toBe(false);
     const dupe = parseDirectorReply('```tasks\n[{"key":"a","title":"x"},{"key":"a","title":"y"}]\n```');
     expect(dupe.ok).toBe(false);
+    const self = parseDirectorReply('```tasks\n[{"key":"a","title":"x","deps":["a"]}]\n```');
+    expect(self.ok).toBe(false);
+    const loop = parseDirectorReply(
+      '```tasks\n[{"key":"a","title":"x","deps":["c"]},{"key":"b","title":"y","deps":["a"]},{"key":"c","title":"z","deps":["b"]}]\n```',
+    );
+    expect(loop.ok).toBe(false);
+    if (!loop.ok) expect(loop.error).toContain("cycle");
+    const chain = parseDirectorReply(
+      '```tasks\n[{"key":"a","title":"x"},{"key":"b","title":"y","deps":["a"]},{"key":"c","title":"z","deps":["a","b"]}]\n```',
+    );
+    expect(chain.ok).toBe(true);
   });
 });
 

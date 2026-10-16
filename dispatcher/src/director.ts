@@ -116,6 +116,25 @@ export function parseDirectorReply(reply: string, knownTaskIds: ReadonlySet<stri
       }
     }
   }
+  const depsByKey = new Map<string, string[]>();
+  for (const task of all) {
+    if (task.key !== undefined) depsByKey.set(task.key, task.deps.filter((dep) => keys.has(dep)));
+  }
+  const done = new Set<string>();
+  const onPath = new Set<string>();
+  const cyclic = (key: string): boolean => {
+    if (done.has(key) || onPath.has(key)) return onPath.has(key);
+    onPath.add(key);
+    const hit = (depsByKey.get(key) ?? []).some(cyclic);
+    if (!hit) {
+      onPath.delete(key);
+      done.add(key);
+    }
+    return hit;
+  };
+  for (const key of depsByKey.keys()) {
+    if (cyclic(key)) return { ok: false, error: `tasks block has a dependency cycle through ${JSON.stringify(key)}`, text };
+  }
   return { ok: true, tasks: all, text };
 }
 
@@ -221,6 +240,13 @@ export class Director {
     });
     const reply = result.texts.join("\n\n");
     if (result.outcome !== "succeeded") {
+      if (result.outcome === "timeout" && this.conn === session.conn) {
+        // The timed-out turn keeps running in the session; its late events
+        // would end the next turn early. Start a fresh session next time.
+        this.conn = null;
+        this.sessionId = null;
+        await session.conn.close().catch(() => undefined);
+      }
       return { ok: false, reply, error: result.error ?? result.outcome, sessionId: session.sessionId };
     }
     return { ok: true, reply, sessionId: session.sessionId };

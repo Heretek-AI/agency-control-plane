@@ -164,22 +164,28 @@ export function App(): JSX.Element {
   const [displayedSubjectHash, setDisplayedSubjectHash] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const selectedRef = useRef<string | null>(null);
+  const boardRequestRef = useRef(0);
 
   useEffect(() => store.subscribe(() => setSnapshot(store.getState())), [store]);
 
   const refreshBoard = useCallback(async (): Promise<void> => {
+    // Only the newest board request may write: an older response that
+    // finishes late must not restore a stale board.
+    const request = ++boardRequestRef.current;
     try {
       const response = await fetch(BOARD_ENDPOINT);
+      if (request !== boardRequestRef.current) return;
       if (!response.ok) {
         throw new Error(`board request failed with status ${response.status}`);
       }
       const board = (await response.json()) as BoardJson;
+      if (request !== boardRequestRef.current) return;
       seedStoreFromBoard(store, board);
       setMessages(board.messages ?? []);
       setApprovals(board.approvals);
       setBoardError(null);
     } catch (err) {
-      setBoardError(`fleet app: ${(err as Error).message}`);
+      if (request === boardRequestRef.current) setBoardError(`fleet app: ${(err as Error).message}`);
     }
   }, [store]);
 
@@ -194,6 +200,8 @@ export function App(): JSX.Element {
           toolLog?: Array<{ seq: number; tool: string; input: string; output: string }>;
           diffs?: DiffHunk[];
         };
+        // The selection may have changed while the body was read.
+        if (selectedRef.current !== taskId) return;
         const card = store.getState().tasks.find((entry) => entry.id === taskId);
         store.setDrilldown({
           sessionId: view.session?.sessionId ?? `sess-${taskId}`,

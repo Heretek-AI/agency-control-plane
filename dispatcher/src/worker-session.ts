@@ -164,11 +164,11 @@ export async function runTurn(
     if (options.signal?.aborted === true) {
       onAbort();
     } else {
-      try {
-        await conn.client.prompt(sessionId, text);
-      } catch (err) {
+      // Not awaited: a stalled admission request must not hold the turn
+      // past its timeout, abort, or worker exit.
+      conn.client.prompt(sessionId, text).catch((err: unknown) => {
         settle({ outcome: "failed", texts, error: (err as Error).message });
-      }
+      });
     }
     return await done;
   } finally {

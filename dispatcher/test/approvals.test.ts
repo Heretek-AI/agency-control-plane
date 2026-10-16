@@ -230,6 +230,12 @@ describe("approval attacks (each must be refused and leave the task waitingHuman
     const replayedSig = await post(app, "/api/approvals/task-k/sign", { ticket: second.ticket, signatureHex: firstSig });
     expect(replayedSig.status).toBe(403);
     expect(app.getTask("task-k")?.status).toBe("waitingHuman");
+    // A fresh, unused task-k ticket is refused on task-h for its binding.
+    const third = await mint(app, "task-k");
+    const cross = await post(app, "/api/approvals/task-h/sign", { ticket: third.ticket, signatureHex: firstSig });
+    expect(cross.status).toBe(403);
+    expect(((await cross.json()) as { code: string }).code).toBe("binding-mismatch");
+    expect(app.getTask("task-h")?.status).toBe("waitingHuman");
     // The genuine pair works once ...
     const ok = await post(app, "/api/approvals/task-k/sign", { ticket: first.ticket, signatureHex: firstSig });
     expect(ok.status).toBe(200);
@@ -237,10 +243,6 @@ describe("approval attacks (each must be refused and leave the task waitingHuman
     const replay = await post(app, "/api/approvals/task-k/sign", { ticket: first.ticket, signatureHex: firstSig });
     expect(replay.status).toBe(403);
     expect(((await replay.json()) as { code: string }).code).toBe("reused-ticket");
-    // Same subject on another task: the ticket/signature of task-k never approves task-h.
-    const cross = await post(app, "/api/approvals/task-h/sign", { ticket: second.ticket, signatureHex: firstSig });
-    expect(cross.status).toBe(403);
-    expect(app.getTask("task-h")?.status).toBe("waitingHuman");
     await app.shutdown();
   });
 

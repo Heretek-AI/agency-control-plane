@@ -25,7 +25,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs, parseCommand } from "./cli-args.js";
-import { NatsJetStreamBridge, natsUrlFromEnv } from "./nats-bridge.js";
+import { NatsJetStreamBridge, natsUrlFromEnv, redactNatsUrl } from "./nats-bridge.js";
 import { startServer } from "./server.js";
 
 function int(value: string | undefined, fallback: number, name: string): number {
@@ -36,7 +36,7 @@ function int(value: string | undefined, fallback: number, name: string): number 
 }
 
 async function main(): Promise<void> {
-  const { flags, switches } = parseArgs(process.argv.slice(2));
+  const { flags, switches } = parseArgs(process.argv.slice(2), new Set(["no-workers", "no-director"]));
   const env = process.env;
   const repoDir = resolve(flags.get("repo") ?? env["FLEET_REPO"] ?? process.cwd());
   const stateDir = resolve(flags.get("state-dir") ?? env["FLEET_STATE_DIR"] ?? join(homedir(), ".local", "state", "agency-control-plane"));
@@ -74,7 +74,7 @@ async function main(): Promise<void> {
       app.attachNats(await NatsJetStreamBridge.connect(natsUrl));
     } catch (err) {
       await running.stop();
-      throw new Error(`NATS_URL=${natsUrl} is set but JetStream is unreachable: ${(err as Error).message}`);
+      throw new Error(`NATS_URL=${redactNatsUrl(natsUrl)} is set but JetStream is unreachable: ${(err as Error).message}`);
     }
   }
   console.log(`fleet dispatcher listening on ${running.url}`);
@@ -86,7 +86,7 @@ async function main(): Promise<void> {
       ? `  approvals: pinned human key ${app.humanKey.fingerprint.slice(0, 16)}… (${app.humanKey.sourcePath})`
       : `  approvals: DISABLED (fail closed): ${app.approvalsUnavailableReason ?? "no key"}`,
   );
-  console.log(`  nats:      ${natsUrl ?? "off (set NATS_URL to mirror into JetStream)"}`);
+  console.log(`  nats:      ${natsUrl !== null ? redactNatsUrl(natsUrl) : "off (set NATS_URL to mirror into JetStream)"}`);
   let stopping = false;
   const stop = (signal: string): void => {
     if (stopping) return;

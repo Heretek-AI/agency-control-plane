@@ -1,5 +1,11 @@
-/** Minimal `--flag value` / `--flag=value` / `--switch` parser shared by the CLIs. */
-export function parseArgs(argv: readonly string[]): { flags: Map<string, string>; switches: Set<string> } {
+/**
+ * Minimal `--flag value` / `--flag=value` / `--switch` parser shared by the CLIs.
+ * Names in `knownSwitches` take no operand; every other flag requires one.
+ */
+export function parseArgs(
+  argv: readonly string[],
+  knownSwitches: ReadonlySet<string> = new Set(),
+): { flags: Map<string, string>; switches: Set<string> } {
   const flags = new Map<string, string>();
   const switches = new Set<string>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -9,16 +15,22 @@ export function parseArgs(argv: readonly string[]): { flags: Map<string, string>
     }
     const eq = arg.indexOf("=");
     if (eq !== -1) {
-      flags.set(arg.slice(2, eq), arg.slice(eq + 1));
+      const name = arg.slice(2, eq);
+      if (knownSwitches.has(name)) throw new Error(`--${name} takes no value`);
+      flags.set(name, arg.slice(eq + 1));
+      continue;
+    }
+    const name = arg.slice(2);
+    if (knownSwitches.has(name)) {
+      switches.add(name);
       continue;
     }
     const next = argv[index + 1];
-    if (next !== undefined && !next.startsWith("--")) {
-      flags.set(arg.slice(2), next);
-      index += 1;
-    } else {
-      switches.add(arg.slice(2));
+    if (next === undefined || next.startsWith("--")) {
+      throw new Error(`--${name} requires a value`);
     }
+    flags.set(name, next);
+    index += 1;
   }
   return { flags, switches };
 }

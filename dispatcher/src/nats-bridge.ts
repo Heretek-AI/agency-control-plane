@@ -34,6 +34,20 @@ export function natsUrlFromEnv(env: Record<string, string | undefined> = process
   return url !== undefined && url.trim().length > 0 ? url.trim() : null;
 }
 
+/** `NATS_URL` with any userinfo (user, password, token) replaced by `***`, for logs. */
+export function redactNatsUrl(url: string): string {
+  return url
+    .split(",")
+    .map((server) => {
+      const at = server.lastIndexOf("@");
+      if (at === -1) return server;
+      const scheme = server.indexOf("://");
+      const prefix = scheme !== -1 && scheme < at ? server.slice(0, scheme + 3) : "";
+      return `${prefix}***@${server.slice(at + 1)}`;
+    })
+    .join(",");
+}
+
 /** JetStream subject for a bus event type (tokens restricted to `[A-Za-z0-9_-]`). */
 export function subjectFor(type: string): string {
   const tokens = type.split(".").map((token) => token.replace(/[^A-Za-z0-9_-]/g, "_")).filter((token) => token.length > 0);
@@ -73,12 +87,15 @@ export class NatsJetStreamBridge {
         discard: DiscardPolicy.Old,
         max_msgs: options.capacity ?? 10_000,
       };
+      let exists = true;
       try {
         await jsm.streams.info(stream);
-        await jsm.streams.update(stream, config);
       } catch {
-        await jsm.streams.add(config);
+        exists = false;
       }
+      // Only a missing stream is created; an update error surfaces as-is.
+      if (exists) await jsm.streams.update(stream, config);
+      else await jsm.streams.add(config);
       const js = nc.jetstream();
       const kv = await js.views.kv(options.bucket ?? FLEET_KV_BUCKET, { history: 1 });
       return new NatsJetStreamBridge(nc, js, kv, stream);

@@ -11,7 +11,7 @@ import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "nats";
-import { NatsJetStreamBridge, natsUrlFromEnv, subjectFor } from "../src/nats-bridge.js";
+import { NatsJetStreamBridge, natsUrlFromEnv, redactNatsUrl, subjectFor } from "../src/nats-bridge.js";
 import { createServer } from "../src/server.js";
 
 function natsServerBinary(): string | null {
@@ -68,6 +68,9 @@ describe("nats bridge helpers", () => {
     expect(natsUrlFromEnv({ NATS_URL: "  " })).toBeNull();
     expect(natsUrlFromEnv({ NATS_URL: "nats://127.0.0.1:4222" })).toBe("nats://127.0.0.1:4222");
     expect(subjectFor("worker.tool")).toBe("fleet.events.worker.tool");
+    expect(redactNatsUrl("nats://127.0.0.1:4222")).toBe("nats://127.0.0.1:4222");
+    expect(redactNatsUrl("nats://user:s3cret@host:4222")).toBe("nats://***@host:4222");
+    expect(redactNatsUrl("tok@host:4222,nats://a:b@other:4222")).toBe("***@host:4222,nats://***@other:4222");
     expect(subjectFor("a b.*.>")).toBe("fleet.events.a_b._._");
   });
 
