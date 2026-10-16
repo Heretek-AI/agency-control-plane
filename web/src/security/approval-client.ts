@@ -1,61 +1,58 @@
 /**
- * Human-approval signing client for the Wave 3 WebUI (Pillar 5).
+ * Human-approval signing client (Pillar 5), browser-native.
  *
- * BINDING SECURITY INVARIANT I1: the human secret entered in the
- * approval dialog is held ONLY in a lexical function-closure variable
- * for the duration of the `fetch("/api/approvals/:id/sign")` call, is
- * zeroed (overwritten and nulled) in a `finally` block immediately
- * after the call settles, and is NEVER written to `fleet-store`,
- * `localStorage`, `sessionStorage`, or DOM data attributes. This module
- * imports no store, touches no browser storage, and never renders DOM —
- * the raw secret is used solely to derive an Ed25519 keypair and sign
- * the subject hash, and only the resulting signature plus public key
- * leave the closure over the wire.
+ * The human signs the dispatcher's es-core-compatible approval payload
+ * `{ runId, stage, subjectHash, timestamp }` (canonical sorted-key JSON)
+ * with the Ed25519 private key whose public half the dispatcher pins
+ * (`human.pub`). The key comes from a file the human chooses in the
+ * drawer:
+ *
+ * - the sealed `human.key.enc` envelope written by `bun run keygen` or
+ *   es-core `sealHumanKey` (scrypt N=16384 r=8 p=1 -> AES-256-GCM over
+ *   PKCS#8 DER), unlocked with the passphrase; or
+ * - an unencrypted PKCS#8 private key (PEM `BEGIN PRIVATE KEY` or DER).
+ *
+ * All crypto is WebCrypto (`crypto.subtle`: Ed25519 sign/verify, AES-GCM,
+ * SHA-256) plus `@noble/hashes` scrypt; no Node APIs.
+ *
+ * BINDING SECURITY INVARIANT I1: the passphrase, the key-file bytes, the
+ * scrypt-derived key, and the decrypted PKCS#8 bytes live ONLY in local
+ * variables of `approveWithKeyFile` for the duration of the
+ * `fetch("/api/approvals/:id/sign")` call. Byte buffers are zero-filled
+ * and every reference is nulled in `finally`; the imported signing key is
+ * a non-extractable `CryptoKey`. Nothing is written to `fleet-store`,
+ * `localStorage`, `sessionStorage`, or DOM data attributes, and only the
+ * signature leaves the closure over the wire. This module imports no
+ * store and renders no DOM.
  */
+import { scrypt } from "@noble/hashes/scrypt";
 
-import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
-
-/** Number of approval closures currently holding a live secret (0 at rest). */
+/** Number of approval closures currently holding live secret material (0 at rest). */
 let liveSecrets = 0;
 
-/** Observable proof that closure secrets are zeroed after every call. */
+/** Observable proof that closure secrets are released after every call. */
 export function activeApprovalSecrets(): number {
   return liveSecrets;
 }
 
-/** PKCS8 DER prefix for an Ed25519 private key; concat with a 32-byte seed. */
-const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-
-/** Domain separator matching the dispatcher's passphrase derivation. */
-const APPROVAL_DOMAIN = "agency-approval-v1:";
-
-function deriveKeypairPem(secret: string): { publicKeyPem: string; privateKeyPem: string } {
-  if (secret.length === 0) {
-    throw new Error("approval-client: secret must not be empty");
-  }
-  const seed = createHash("sha256").update(`${APPROVAL_DOMAIN}${secret}`, "utf8").digest();
-  const privateKey = createPrivateKey({
-    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
-    format: "der",
-    type: "pkcs8",
-  });
-  const publicKey = createPublicKey(privateKey);
-  seed.fill(0);
-  return {
-    publicKeyPem: publicKey.export({ format: "pem", type: "spki" }) as string,
-    privateKeyPem: privateKey.export({ format: "pem", type: "pkcs8" }) as string,
-  };
+export interface ApprovalPayload {
+  runId: string;
+  stage: string;
+  subjectHash: string;
+  timestamp: string;
 }
 
-function signSubject(privateKeyPem: string, subjectHash: string): string {
-  const privateKey = createPrivateKey({ key: privateKeyPem, format: "pem" });
-  return sign(null, Buffer.from(subjectHash, "utf8"), privateKey).toString("hex");
-}
-
-export interface SignRequestOptions {
-  csrfToken?: string | undefined;
-  approve?: boolean | undefined;
-  fetchImpl?: FetchLike | undefined;
+/** The ticket the dispatcher mints (`POST /api/approvals/:taskId/ticket`). */
+export interface ApprovalTicketView {
+  ticket: string;
+  taskId: string;
+  subjectHash: string;
+  timestamp: string;
+  expiresAtMs: number;
+  keyFingerprint: string;
+  publicKeyHex: string;
+  payloads: { approve: ApprovalPayload; reject: ApprovalPayload };
+  diff: { files: number; additions: number; deletions: number };
 }
 
 export interface ApprovalResult {
@@ -66,27 +63,158 @@ export interface ApprovalResult {
 
 /**
  * Minimal fetch surface the signing client needs. Deliberately narrower
- * than `typeof fetch` (Bun's fetch carries extra members like
- * `preconnect`) so tests can inject dependency-free fakes.
+ * than `typeof fetch` so tests can inject dependency-free fakes.
  */
 export type FetchLike = (
   url: string,
   init?: { method?: string | undefined; headers?: Record<string, string> | undefined; body?: string | undefined },
 ) => Promise<Response>;
 
-export interface OneClickAuthority {
-  signature: string;
-  publicKey: string;
+export interface SignRequestOptions {
+  csrfToken?: string | undefined;
+  approve?: boolean | undefined;
+  fetchImpl?: FetchLike | undefined;
+  /** Subject hash the UI computed from the diff it displays; signing refuses on mismatch. */
+  expectedSubjectHash?: string | undefined;
 }
 
-async function postSign(
-  taskId: string,
-  body: Record<string, unknown>,
-  options: SignRequestOptions,
-): Promise<ApprovalResult> {
-  if (taskId.trim().length === 0) {
-    throw new Error("approval-client: task id must be a non-empty string");
+/** Canonical JSON of the four payload fields (sorted keys, no whitespace) — identical to es-core. */
+export function canonicalApprovalPayload(payload: ApprovalPayload): string {
+  const ordered: Array<[string, string]> = [
+    ["runId", payload.runId],
+    ["stage", payload.stage],
+    ["subjectHash", payload.subjectHash],
+    ["timestamp", payload.timestamp],
+  ];
+  return `{${ordered.map(([key, value]) => `${JSON.stringify(key)}:${JSON.stringify(value)}`).join(",")}}`;
+}
+
+export function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
+  return out;
+}
+
+export function hexToBytes(hex: string): Uint8Array<ArrayBuffer> {
+  if (!/^(?:[0-9a-f]{2})*$/i.test(hex)) {
+    throw new Error("approval-client: malformed hex");
   }
+  const out = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < out.length; index += 1) {
+    out[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return out;
+}
+
+/** SHA-256 hex (WebCrypto). */
+export async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+/** The approval subject of a diff: SHA-256 of the concatenated per-file patches (mirrors the dispatcher). */
+export async function subjectHashForHunks(hunks: ReadonlyArray<{ patch: string }>): Promise<string> {
+  return sha256Hex(hunks.map((hunk) => hunk.patch).join(""));
+}
+
+interface SealedEnvelope {
+  version: number;
+  kdf: string;
+  n: number;
+  r: number;
+  p: number;
+  salt: string;
+  iv: string;
+  tag: string;
+  data: string;
+}
+
+function parseEnvelope(text: string): SealedEnvelope | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const env = parsed as Partial<SealedEnvelope>;
+  if (
+    env.version !== 1 ||
+    env.kdf !== "scrypt" ||
+    !Number.isInteger(env.n) ||
+    !Number.isInteger(env.r) ||
+    !Number.isInteger(env.p) ||
+    typeof env.salt !== "string" ||
+    typeof env.iv !== "string" ||
+    typeof env.tag !== "string" ||
+    typeof env.data !== "string"
+  ) {
+    throw new Error("approval-client: sealed key envelope is malformed");
+  }
+  return env as SealedEnvelope;
+}
+
+function pemToDer(text: string): Uint8Array<ArrayBuffer> | null {
+  const begin = "-----BEGIN PRIVATE KEY-----";
+  const start = text.indexOf(begin);
+  if (start === -1) return null;
+  const end = text.indexOf("-----END PRIVATE KEY-----", start + begin.length);
+  if (end === -1) return null;
+  const binary = atob(text.slice(start + begin.length, end).split("").filter((ch) => ch.trim().length > 0).join(""));
+  const out = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) out[index] = binary.charCodeAt(index);
+  return out;
+}
+
+/** True when the chosen key file is a (JSON) sealed envelope that needs the passphrase. */
+export function keyFileNeedsPassphrase(fileBytes: Uint8Array): boolean {
+  return new TextDecoder().decode(fileBytes).trimStart().startsWith("{");
+}
+
+/**
+ * Decode the key file into PKCS#8 DER. The returned buffer is owned by
+ * the caller and must be zero-filled after use.
+ */
+async function unlockPkcs8(fileBytes: Uint8Array, passphrase: string | null): Promise<Uint8Array<ArrayBuffer>> {
+  const text = new TextDecoder().decode(fileBytes);
+  const envelope = text.trimStart().startsWith("{") ? parseEnvelope(text) : null;
+  if (envelope !== null) {
+    if (passphrase === null || passphrase.length === 0) {
+      throw new Error("approval-client: the sealed key needs its passphrase");
+    }
+    const passBytes = new TextEncoder().encode(passphrase);
+    let derived: Uint8Array<ArrayBuffer> | null = null;
+    try {
+      derived = scrypt(passBytes, hexToBytes(envelope.salt), {
+        N: envelope.n,
+        r: envelope.r,
+        p: envelope.p,
+        dkLen: 32,
+      }) as Uint8Array<ArrayBuffer>;
+      const aes = await crypto.subtle.importKey("raw", derived, { name: "AES-GCM" }, false, ["decrypt"]);
+      const data = hexToBytes(envelope.data);
+      const tag = hexToBytes(envelope.tag);
+      const sealed = new Uint8Array(data.length + tag.length);
+      sealed.set(data, 0);
+      sealed.set(tag, data.length);
+      try {
+        return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: hexToBytes(envelope.iv) }, aes, sealed));
+      } catch {
+        throw new Error("approval-client: wrong passphrase or tampered sealed key");
+      }
+    } finally {
+      passBytes.fill(0);
+      derived?.fill(0);
+      derived = null;
+    }
+  }
+  const pem = pemToDer(text);
+  if (pem !== null) return pem;
+  if (fileBytes[0] === 0x30) return new Uint8Array(fileBytes);
+  throw new Error("approval-client: key file is neither a sealed human.key.enc nor a PKCS#8 private key");
+}
+
+async function postSign(taskId: string, body: Record<string, unknown>, options: SignRequestOptions): Promise<ApprovalResult> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (options.csrfToken !== undefined && options.csrfToken.length > 0) {
@@ -122,101 +250,78 @@ async function postSign(
   return { taskId: record.taskId, status: record.status, subjectHash: record.subjectHash };
 }
 
+function checkTicket(taskId: string, ticket: ApprovalTicketView, approve: boolean, expected: string | undefined): ApprovalPayload {
+  if (taskId.trim().length === 0) throw new Error("approval-client: task id must be a non-empty string");
+  if (ticket.ticket.trim().length === 0) throw new Error("approval-client: ticket must be a non-empty string");
+  if (ticket.taskId !== taskId) throw new Error("approval-client: ticket was minted for another task");
+  const payload = approve ? ticket.payloads.approve : ticket.payloads.reject;
+  if (
+    payload.runId !== taskId ||
+    payload.stage !== (approve ? "APPROVE" : "REJECT") ||
+    payload.subjectHash !== ticket.subjectHash ||
+    payload.timestamp !== ticket.timestamp
+  ) {
+    throw new Error("approval-client: ticket payload is inconsistent; refusing to sign");
+  }
+  if (expected !== undefined && expected !== ticket.subjectHash) {
+    throw new Error("approval-client: the diff shown does not hash to the ticket's subjectHash; refusing to sign");
+  }
+  return payload;
+}
+
 /**
- * Sign an approval with a human secret. The secret lives ONLY in the
- * `secret` closure variable below: it derives the Ed25519 keypair, signs
- * the subject hash, and is overwritten + nulled in `finally`. The raw
- * secret is never placed in the request body (only the derived signature
- * and public key are sent) and never escapes this function.
+ * Sign an approval (or rejection) with the human key file. `keyFileBytes`
+ * is consumed: it is zero-filled before this function returns, as is
+ * every derived secret. The signature is checked against the pinned
+ * public key from the ticket before anything is sent, so a wrong key
+ * fails locally.
  */
-export async function approveWithSecret(
+export async function approveWithKeyFile(
   taskId: string,
-  ticket: string,
-  secretValue: string,
-  subjectHash: string,
+  ticket: ApprovalTicketView,
+  keyFileBytes: Uint8Array,
+  passphraseValue: string,
   options: SignRequestOptions = {},
 ): Promise<ApprovalResult> {
-  if (ticket.trim().length === 0) {
-    throw new Error("approval-client: ticket must be a non-empty string");
-  }
-  if (subjectHash.trim().length === 0) {
-    throw new Error("approval-client: subjectHash must be a non-empty string");
-  }
+  const approve = options.approve !== false;
   liveSecrets += 1;
-  let secret: string | null = secretValue;
-  let privateKeyPem: string | null = null;
-  let requestBody: Record<string, unknown> | null = null;
+  let secret: string | null = passphraseValue;
+  let fileBytes: Uint8Array | null = keyFileBytes;
+  let pkcs8: Uint8Array<ArrayBuffer> | null = null;
+  let signingKey: CryptoKey | null = null;
   try {
-    if (secret === null || secret.length === 0) {
-      throw new Error("approval-client: secret must not be empty");
+    const payload = checkTicket(taskId, ticket, approve, options.expectedSubjectHash);
+    pkcs8 = await unlockPkcs8(fileBytes, secret);
+    secret = "";
+    secret = null;
+    try {
+      signingKey = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+    } catch {
+      throw new Error("approval-client: key file is not an Ed25519 PKCS#8 private key");
     }
-    const keypair = deriveKeypairPem(secret);
-    privateKeyPem = keypair.privateKeyPem;
-    const signature = signSubject(privateKeyPem, subjectHash);
-    requestBody = {
-      ticket,
-      subjectHash,
-      signature,
-      publicKey: keypair.publicKeyPem,
-      approve: options.approve !== false,
-    };
-    return await postSign(taskId, requestBody, options);
+    const message = new TextEncoder().encode(canonicalApprovalPayload(payload));
+    const signature = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, signingKey, message));
+    const pinned = await crypto.subtle.importKey("spki", hexToBytes(ticket.publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
+    if (!(await crypto.subtle.verify({ name: "Ed25519" }, pinned, signature, message))) {
+      throw new Error("approval-client: this key is not the dispatcher's pinned human key");
+    }
+    return await postSign(
+      taskId,
+      { ticket: ticket.ticket, approve, subjectHash: ticket.subjectHash, signatureHex: bytesToHex(signature) },
+      options,
+    );
   } finally {
     if (secret !== null) {
       secret = "";
     }
     secret = null;
-    privateKeyPem = null;
-    requestBody = null;
+    pkcs8?.fill(0);
+    pkcs8 = null;
+    fileBytes?.fill(0);
+    fileBytes = null;
+    signingKey = null;
     liveSecrets -= 1;
   }
-}
-
-/**
- * Backwards-compatible alias: the approval-dialog secret is handled with
- * the exact closure discipline documented for `approveWithSecret`.
- */
-export async function approveWithPassphrase(
-  taskId: string,
-  ticket: string,
-  passphrase: string,
-  subjectHash: string,
-  options: SignRequestOptions = {},
-): Promise<ApprovalResult> {
-  return approveWithSecret(taskId, ticket, passphrase, subjectHash, options);
-}
-
-/**
- * One-click approval with an explicit (e.g. ephemeral 1-click) Ed25519
- * authority. No human secret is involved in this path at all.
- */
-export async function approveOneClick(
-  taskId: string,
-  ticket: string,
-  subjectHash: string,
-  authority: OneClickAuthority,
-  options: SignRequestOptions = {},
-): Promise<ApprovalResult> {
-  if (ticket.trim().length === 0) {
-    throw new Error("approval-client: ticket must be a non-empty string");
-  }
-  if (subjectHash.trim().length === 0) {
-    throw new Error("approval-client: subjectHash must be a non-empty string");
-  }
-  if (authority.signature.length === 0 || authority.publicKey.length === 0) {
-    throw new Error("approval-client: one-click authority requires a signature and a public key");
-  }
-  return postSign(
-    taskId,
-    {
-      ticket,
-      subjectHash,
-      signature: authority.signature,
-      publicKey: authority.publicKey,
-      approve: options.approve !== false,
-    },
-    options,
-  );
 }
 
 export interface LeakProbeEvidence {
@@ -238,8 +343,7 @@ export interface LeakProbeResult {
 /**
  * Pure helper for tests: assert that a secret value appears in NONE of
  * the observable sinks (store snapshot, DOM HTML, local/session storage
- * dumps). Returns `{ ok: false, findings }` fail-closed on any leak or
- * on unserializable evidence.
+ * dumps) and that no closure still holds secret material.
  */
 export function assertNoSecretLeak(secretValue: string, evidence: LeakProbeEvidence): LeakProbeResult {
   const findings: string[] = [];
@@ -276,10 +380,7 @@ export function assertNoSecretLeak(secretValue: string, evidence: LeakProbeEvide
   return { ok: findings.length === 0, findings };
 }
 
-/**
- * Alias kept for the approval-invariant test vocabulary: the dialog
- * secret must never leak into any observable sink.
- */
+/** Alias kept for the approval-invariant test vocabulary. */
 export function assertNoPassphraseLeak(passphrase: string, evidence: LeakProbeEvidence): LeakProbeResult {
   return assertNoSecretLeak(passphrase, evidence);
 }

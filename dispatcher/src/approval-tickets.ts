@@ -1,34 +1,19 @@
 /**
- * Single-use human-approval preview tickets plus loopback Ed25519 helpers.
+ * Single-use human-approval preview tickets.
  *
  * A ticket is a random 256-bit token bound to `{ taskId, subjectHash }`
- * with a 60-second TTL. Verification is consume-on-verify: the first
- * successful `verifyTicket` / `redeemTicket` burns the ticket, and any
- * unknown, expired, reused, or binding-mismatched token is rejected
- * fail-closed with a descriptive error.
+ * with a 60-second TTL and a server-chosen, strictly increasing ISO
+ * `timestamp`. The human signs the es-core-compatible payload
+ * `{ runId: taskId, stage, subjectHash, timestamp }` taken verbatim from
+ * the ticket (see `human-key.ts`), so a signature is only ever valid for
+ * one ticket. Verification is consume-on-verify: the first
+ * `verifyTicket` / `redeemTicket` burns the ticket, and any unknown,
+ * expired, reused, or binding-mismatched token is rejected fail-closed.
  *
- * Ed25519 approval signatures are created and verified with
- * `node:crypto` (in-memory only; no key material is ever persisted by
- * this module). Two authority modes are supported:
- *
- * - Random keypair (`generateApprovalKeyPair`): the human approves with
- *   a 1-click ephemeral key; the server verifies the signature over the
- *   exact `subjectHash` bytes against the presented public key.
- * - Passphrase-derived keypair (`passphraseToKeypair`): the 32-byte seed
- *   is `SHA-256("agency-approval-v1:" + passphrase)` imported as a PKCS8
- *   Ed25519 private key. A wrong passphrase derives a different public
- *   key, so verification fails closed. The passphrase itself lives only
- *   in the caller's closure and is never stored here.
+ * Signature verification lives in `human-key.ts` and only ever uses the
+ * pinned human public key; this module holds no key material.
  */
-import {
-  createHash,
-  createPrivateKey,
-  createPublicKey,
-  generateKeyPairSync,
-  randomBytes,
-  sign,
-  verify,
-} from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 export const TICKET_TTL_MS = 60_000;
 export const TICKET_BYTES = 32;
@@ -37,6 +22,8 @@ export interface TicketRecord {
   token: string;
   taskId: string;
   subjectHash: string;
+  /** ISO timestamp the human signs; unique per store (strictly increasing). */
+  timestamp: string;
   issuedAtMs: number;
   expiresAtMs: number;
   used: boolean;
@@ -45,6 +32,13 @@ export interface TicketRecord {
 export interface TicketBinding {
   taskId: string;
   subjectHash: string;
+  timestamp: string;
+}
+
+export interface MintedTicket {
+  token: string;
+  expiresAtMs: number;
+  timestamp: string;
 }
 
 export class TicketError extends Error {
@@ -75,6 +69,7 @@ export class TicketStore {
   private readonly tickets = new Map<string, TicketRecord>();
   private readonly clock: () => number;
   private readonly ttlMs: number;
+  private lastStampMs = 0;
 
   constructor(clock: () => number = Date.now, ttlMs: number = TICKET_TTL_MS) {
     if (ttlMs <= 0) {
@@ -85,21 +80,26 @@ export class TicketStore {
   }
 
   /** Mint a random 256-bit ticket bound to `{ taskId, subjectHash }`. */
-  mintTicket(taskId: string, subjectHash: string): { token: string; expiresAtMs: number } {
+  mintTicket(taskId: string, subjectHash: string): MintedTicket {
     requireBinding(taskId, "task id");
     requireBinding(subjectHash, "subject hash");
     this.pruneExpired();
     const issuedAtMs = this.clock();
+    // Strictly increasing signed timestamps: two tickets never share a
+    // payload, so a signature can never be replayed onto another ticket.
+    const stampMs = Math.max(issuedAtMs, this.lastStampMs + 1);
+    this.lastStampMs = stampMs;
     const record: TicketRecord = {
       token: randomBytes(TICKET_BYTES).toString("hex"),
       taskId,
       subjectHash,
+      timestamp: new Date(stampMs).toISOString(),
       issuedAtMs,
       expiresAtMs: issuedAtMs + this.ttlMs,
       used: false,
     };
     this.tickets.set(record.token, record);
-    return { token: record.token, expiresAtMs: record.expiresAtMs };
+    return { token: record.token, expiresAtMs: record.expiresAtMs, timestamp: record.timestamp };
   }
 
   /** Consume-on-verify: returns the binding and burns the ticket. Fail-closed on unknown/expired/reused tokens. */
@@ -116,7 +116,7 @@ export class TicketStore {
       throw new TicketError("expired-ticket", "approval ticket has expired");
     }
     record.used = true;
-    return { taskId: record.taskId, subjectHash: record.subjectHash };
+    return { taskId: record.taskId, subjectHash: record.subjectHash, timestamp: record.timestamp };
   }
 
   /**
@@ -144,7 +144,7 @@ export class TicketStore {
         `approval ticket is bound to task ${JSON.stringify(record.taskId)}, not ${JSON.stringify(taskId)}`,
       );
     }
-    return { taskId: record.taskId, subjectHash: record.subjectHash };
+    return { taskId: record.taskId, subjectHash: record.subjectHash, timestamp: record.timestamp };
   }
 
   /** Live (unexpired, unused) ticket count, after pruning. */
@@ -170,7 +170,7 @@ export class TicketStore {
 const defaultStore = new TicketStore();
 
 /** Mint from the module-default store (60s TTL). */
-export function mintTicket(taskId: string, subjectHash: string): { token: string; expiresAtMs: number } {
+export function mintTicket(taskId: string, subjectHash: string): MintedTicket {
   return defaultStore.mintTicket(taskId, subjectHash);
 }
 
@@ -182,67 +182,4 @@ export function verifyTicket(token: string): TicketBinding {
 /** Binding-checked redeem from the module-default store. */
 export function redeemTicket(token: string, taskId: string, subjectHash: string): TicketBinding {
   return defaultStore.redeemTicket(token, taskId, subjectHash);
-}
-
-export interface ApprovalKeypair {
-  publicKeyPem: string;
-  privateKeyPem: string;
-}
-
-/** Random Ed25519 authority keypair (PEM-encoded PKCS8 / SPKI). */
-export function generateApprovalKeyPair(): ApprovalKeypair {
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  return {
-    publicKeyPem: publicKey.export({ format: "pem", type: "spki" }) as string,
-    privateKeyPem: privateKey.export({ format: "pem", type: "pkcs8" }) as string,
-  };
-}
-
-/** PKCS8 DER prefix for an Ed25519 private key; concat with a 32-byte seed. */
-const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-
-/**
- * Derive an Ed25519 keypair deterministically from a passphrase:
- * `seed = SHA-256("agency-approval-v1:" + passphrase)` imported as a
- * raw PKCS8 seed. Empty passphrases are rejected fail-closed. The
- * passphrase is used only inside this call and never retained.
- */
-export function passphraseToKeypair(passphrase: string): ApprovalKeypair {
-  if (passphrase.length === 0) {
-    throw new Error("passphrase must not be empty");
-  }
-  const seed = createHash("sha256").update(`agency-approval-v1:${passphrase}`, "utf8").digest();
-  const privateKey = createPrivateKey({
-    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
-    format: "der",
-    type: "pkcs8",
-  });
-  const publicKey = createPublicKey(privateKey);
-  return {
-    publicKeyPem: publicKey.export({ format: "pem", type: "spki" }) as string,
-    privateKeyPem: privateKey.export({ format: "pem", type: "pkcs8" }) as string,
-  };
-}
-
-/** Sign the exact `subjectHash` bytes with an Ed25519 private key (PEM). Returns hex. */
-export function signSubjectHash(privateKeyPem: string, subjectHash: string): string {
-  const privateKey = createPrivateKey({ key: privateKeyPem, format: "pem" });
-  return sign(null, Buffer.from(subjectHash, "utf8"), privateKey).toString("hex");
-}
-
-/**
- * Verify an Ed25519 signature over the exact `subjectHash` bytes.
- * Returns false (fail-closed) for malformed keys, malformed
- * signatures, and genuine mismatches alike.
- */
-export function verifyApprovalSignature(publicKeyPem: string, subjectHash: string, signatureHex: string): boolean {
-  try {
-    if (!/^[0-9a-fA-F]+$/.test(signatureHex) || signatureHex.length % 2 !== 0) {
-      return false;
-    }
-    const publicKey = createPublicKey({ key: publicKeyPem, format: "pem" });
-    return verify(null, Buffer.from(subjectHash, "utf8"), publicKey, Buffer.from(signatureHex, "hex"));
-  } catch {
-    return false;
-  }
 }

@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 echo "[wave-2] bun install"
-bun install
+bun install --frozen-lockfile --ignore-scripts
 
 echo "[wave-2] typecheck dispatcher"
 bun run --filter './dispatcher' check
@@ -59,7 +59,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allocateWorktree, releaseWorktree, salvageWorktree, WorktreeStore } from "./dispatcher/src/worktrees.ts";
 import { landTask } from "./dispatcher/src/landing.ts";
-import { TicketStore, generateApprovalKeyPair, signSubjectHash } from "./dispatcher/src/approval-tickets.ts";
+import { TicketStore } from "./dispatcher/src/approval-tickets.ts";
+import { sealHumanKey, signApprovalPayload, unsealHumanKey } from "./dispatcher/src/human-key.ts";
 import { EventBus } from "./dispatcher/src/event-bus.ts";
 import { createServer } from "./dispatcher/src/server.ts";
 
@@ -117,7 +118,9 @@ if (replay.gap === null) throw new Error("overflow gap marker missing");
 if (replay.events.length !== 2) throw new Error("ring buffer size wrong");
 
 // board endpoint serves columns + tier + DAG edges; director message decomposes cards
-const app = createServer({});
+const keyDir = mkdtempSync(join(tmpdir(), "wave2-key-"));
+sealHumanKey(keyDir, "wave-2 probe passphrase");
+const app = createServer({ humanPublicKeyPath: join(keyDir, "human.pub") });
 app.upsertTask({ id: "probe-h", status: "waitingHuman", title: "Human gate" });
 const boardRes = await app.fetch(new Request("http://127.0.0.1/api/board"));
 if (boardRes.status !== 200) throw new Error("board endpoint failed");
@@ -127,29 +130,40 @@ if (board.columns.length !== 5) throw new Error("board columns wrong");
 const msgRes = await app.fetch(new Request("http://127.0.0.1/api/director/message", {
   method: "POST",
   headers: { "content-type": "application/json", "x-csrf-token": app.csrfToken },
-  body: JSON.stringify({ message: "Ship it\n- card one\n- card two" }),
+  body: JSON.stringify({ message: "/ship Ship it\n- card one\n- card two" }),
 }));
 if (msgRes.status !== 200) throw new Error("director message failed");
 const msg = await msgRes.json();
 if (msg.tasksCreated.length !== 2) throw new Error("director decomposition failed");
 
-// ticket mint + Ed25519 sign transitions waitingHuman -> ready
-const subject = "probe-subject";
+// server-computed subject + pinned human key: waitingHuman -> done
 const ticketRes = await app.fetch(new Request("http://127.0.0.1/api/approvals/probe-h/ticket", {
   method: "POST",
   headers: { "content-type": "application/json", "x-csrf-token": app.csrfToken },
-  body: JSON.stringify({ subjectHash: subject }),
+  body: JSON.stringify({ subjectHash: "client-chosen-ignored" }),
 }));
 if (ticketRes.status !== 200) throw new Error("ticket mint failed");
-const { ticket } = await ticketRes.json();
-const keys = generateApprovalKeyPair();
+const issued = await ticketRes.json();
+if (issued.subjectHash === "client-chosen-ignored") throw new Error("server accepted a client subjectHash");
+const sign = (signatureHex) => app.fetch(new Request("http://127.0.0.1/api/approvals/probe-h/sign", {
+  method: "POST",
+  headers: { "content-type": "application/json", "x-csrf-token": app.csrfToken },
+  body: JSON.stringify({ ticket: issued.ticket, signatureHex }),
+}));
+const { generateKeyPairSync } = await import("node:crypto");
+const forger = Buffer.from(generateKeyPairSync("ed25519", { privateKeyEncoding: { type: "pkcs8", format: "der" }, publicKeyEncoding: { type: "spki", format: "der" } }).privateKey);
+if ((await sign(signApprovalPayload(forger, issued.payloads.approve))).status !== 403) throw new Error("forged approval accepted");
+const fresh = await (await app.fetch(new Request("http://127.0.0.1/api/approvals/probe-h/ticket", {
+  method: "POST", headers: { "x-csrf-token": app.csrfToken }, body: "{}",
+}))).json();
+const human = unsealHumanKey(keyDir, "wave-2 probe passphrase");
 const signRes = await app.fetch(new Request("http://127.0.0.1/api/approvals/probe-h/sign", {
   method: "POST",
   headers: { "content-type": "application/json", "x-csrf-token": app.csrfToken },
-  body: JSON.stringify({ ticket, subjectHash: subject, signature: signSubjectHash(keys.privateKeyPem, subject), publicKey: keys.publicKeyPem }),
+  body: JSON.stringify({ ticket: fresh.ticket, signatureHex: signApprovalPayload(human, fresh.payloads.approve) }),
 }));
 if (signRes.status !== 200) throw new Error("approval sign failed");
-if ((await signRes.json()).status !== "ready") throw new Error("sign did not transition to ready");
+if ((await signRes.json()).status !== "done") throw new Error("sign did not transition to done");
 store.close();
 console.log("[wave-2] behavior probe passed");
 '

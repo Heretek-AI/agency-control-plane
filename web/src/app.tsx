@@ -19,13 +19,14 @@
  * the store; selecting a card loads `GET /api/tasks/:id/drilldown`.
  * The approval secret never touches this module (Invariant I1).
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApprovalDrawer, type QaVerdict } from "./components/ApprovalDrawer.js";
-import { DirectorChat, decomposeCharter, type DirectorMessageView } from "./components/DirectorChat.js";
+import { DirectorChat, type DirectorMessageView } from "./components/DirectorChat.js";
 import { KanbanBoard } from "./components/KanbanBoard.js";
 import { SplitDiffViewer } from "./components/SplitDiffViewer.js";
 import { WorkerDrillDown } from "./components/WorkerDrillDown.js";
 import { ghostButtonStyle, mutedStyle, palette } from "./components/theme.js";
+import { subjectHashForHunks, type ApprovalTicketView } from "./security/approval-client.js";
 import {
   createFleetStore,
   type BoardColumn,
@@ -52,6 +53,8 @@ interface BoardJson {
   activeTier?: ModelTier | undefined;
   dagEdges?: Array<{ from: string; to: string }> | undefined;
   messages?: DirectorMessageView[] | undefined;
+  approvals?: { available: boolean; reason: string | null; fingerprint: string | null } | undefined;
+  director?: { available: boolean } | undefined;
 }
 
 /** Map a dispatcher task status onto a Kanban column (mirrors server `columnFor`). */
@@ -102,38 +105,50 @@ export function seedStoreFromBoard(store: FleetStore, board: BoardJson): void {
   store.setDag(nodes, board.dagEdges ?? []);
 }
 
-interface SsePayload {
+/** One dispatcher bus frame as delivered over SSE (`data:` of `/api/events`). */
+export interface BusFrame {
+  seq?: number | undefined;
   type?: string | undefined;
-  topic?: string | undefined;
-  taskId?: string | undefined;
-  tool?: string | undefined;
-  input?: string | undefined;
-  output?: string | undefined;
-  targetTier?: ModelTier | undefined;
+  data?: Record<string, unknown> | null | undefined;
 }
 
-/** Apply one SSE payload to the store; unknown shapes are ignored fail-open (display only). */
-export function applySsePayload(store: FleetStore, payload: SsePayload): void {
-  const topic = payload.topic ?? payload.type ?? "";
-  if ((topic === "worker.tool" || topic === "tool") && typeof payload.taskId === "string" && typeof payload.tool === "string") {
-    try {
-      store.appendToolEvent(payload.taskId, {
-        tool: payload.tool,
-        input: payload.input ?? "",
-        output: payload.output ?? "",
-      });
-    } catch {
-      return;
-    }
+/** Bus event types after which the board is re-fetched. */
+export const BOARD_REFRESH_EVENTS: readonly string[] = [
+  "task.updated",
+  "director.message",
+  "approval.signed",
+  "worker.started",
+  "worker.finished",
+] as const;
+
+/** Every event type the UI listens to on the SSE stream. */
+export const SSE_EVENT_TYPES: readonly string[] = [...BOARD_REFRESH_EVENTS, "worker.tool", "worker.gates", "worker.status", "tier.fallback"];
+
+/** Apply one bus frame to the store (tool timeline, tier). Unknown shapes are ignored (display only). */
+export function applySsePayload(store: FleetStore, frame: BusFrame): void {
+  const data = frame.data ?? {};
+  const taskId = data["taskId"];
+  if (frame.type === "worker.tool" && typeof taskId === "string" && typeof data["tool"] === "string") {
+    if (store.getState().drilldown?.taskId !== taskId) return;
+    store.appendToolEvent(taskId, {
+      tool: data["tool"],
+      input: typeof data["input"] === "string" ? data["input"] : "",
+      output: typeof data["output"] === "string" ? data["output"] : "",
+    });
     return;
   }
-  if (topic === "tier.fallback" && payload.targetTier !== undefined) {
-    try {
-      store.setTier(payload.targetTier);
-    } catch {
-      return;
+  if (frame.type === "tier.fallback") {
+    const tier = data["targetTier"];
+    if (tier === "tier-1-opencode" || tier === "tier-2-commercial" || tier === "tier-3-local") {
+      store.setTier(tier);
     }
   }
+}
+
+function jsonHeaders(csrfToken: string | undefined): Record<string, string> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (csrfToken !== undefined) headers["x-csrf-token"] = csrfToken;
+  return headers;
 }
 
 export function App(): JSX.Element {
@@ -142,31 +157,79 @@ export function App(): JSX.Element {
   const [messages, setMessages] = useState<DirectorMessageView[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [ticket, setTicket] = useState<string | null>(null);
+  const [ticket, setTicket] = useState<ApprovalTicketView | null>(null);
   const [csrfToken, setCsrfToken] = useState<string | undefined>(undefined);
   const [boardError, setBoardError] = useState<string | null>(null);
+  const [approvals, setApprovals] = useState<BoardJson["approvals"]>(undefined);
+  const [displayedSubjectHash, setDisplayedSubjectHash] = useState<string | null>(null);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  const boardRequestRef = useRef(0);
 
   useEffect(() => store.subscribe(() => setSnapshot(store.getState())), [store]);
 
+  const refreshBoard = useCallback(async (): Promise<void> => {
+    // Only the newest board request may write: an older response that
+    // finishes late must not restore a stale board.
+    const request = ++boardRequestRef.current;
+    try {
+      const response = await fetch(BOARD_ENDPOINT);
+      if (request !== boardRequestRef.current) return;
+      if (!response.ok) {
+        throw new Error(`board request failed with status ${response.status}`);
+      }
+      const board = (await response.json()) as BoardJson;
+      if (request !== boardRequestRef.current) return;
+      seedStoreFromBoard(store, board);
+      setMessages(board.messages ?? []);
+      setApprovals(board.approvals);
+      setBoardError(null);
+    } catch (err) {
+      if (request === boardRequestRef.current) setBoardError(`fleet app: ${(err as Error).message}`);
+    }
+  }, [store]);
+
+  const loadDrilldown = useCallback(
+    async (taskId: string): Promise<void> => {
+      try {
+        const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/drilldown`);
+        if (!response.ok || selectedRef.current !== taskId) return;
+        const view = (await response.json()) as {
+          session?: { sessionId?: string; status?: string; tier?: ModelTier };
+          stageGates?: Array<{ name: string; status: "pending" | "running" | "pass" | "fail" }>;
+          toolLog?: Array<{ seq: number; tool: string; input: string; output: string }>;
+          diffs?: DiffHunk[];
+        };
+        // The selection may have changed while the body was read.
+        if (selectedRef.current !== taskId) return;
+        const card = store.getState().tasks.find((entry) => entry.id === taskId);
+        store.setDrilldown({
+          sessionId: view.session?.sessionId ?? `sess-${taskId}`,
+          taskId,
+          status: view.session?.status ?? card?.column ?? "running",
+          tier: view.session?.tier ?? store.getState().activeTier,
+          profile: "core",
+          stageGates: view.stageGates ?? [],
+          toolStream: (view.toolLog ?? []).map((entry) => ({
+            seq: entry.seq,
+            tool: entry.tool,
+            input: entry.input,
+            output: entry.output,
+            timestamp: new Date().toISOString(),
+          })),
+          tokens: 0,
+          cost: 0,
+        });
+        store.setDiff(taskId, view.diffs ?? []);
+      } catch (err) {
+        setBoardError(`fleet app: drill-down failed: ${(err as Error).message}`);
+      }
+    },
+    [store],
+  );
+
   useEffect(() => {
     let cancelled = false;
-    async function loadBoard(): Promise<void> {
-      try {
-        const response = await fetch(BOARD_ENDPOINT);
-        if (!response.ok) {
-          throw new Error(`board request failed with status ${response.status}`);
-        }
-        const board = (await response.json()) as BoardJson;
-        if (cancelled) return;
-        seedStoreFromBoard(store, board);
-        setMessages(board.messages ?? []);
-        setBoardError(null);
-      } catch (err) {
-        if (!cancelled) {
-          setBoardError(`fleet app: ${(err as Error).message}`);
-        }
-      }
-    }
     async function loadCsrf(): Promise<void> {
       try {
         const response = await fetch("/api/csrf");
@@ -179,150 +242,123 @@ export function App(): JSX.Element {
         return;
       }
     }
-    void loadBoard();
+    void refreshBoard();
     void loadCsrf();
     return () => {
       cancelled = true;
     };
-  }, [store]);
+  }, [refreshBoard]);
 
   useEffect(() => {
     if (typeof EventSource === "undefined") return;
     const source = new EventSource(EVENTS_ENDPOINT);
-    source.onmessage = (event: MessageEvent) => {
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const scheduleRefresh = (): void => {
+      if (pending !== null) return;
+      pending = setTimeout(() => {
+        pending = null;
+        void refreshBoard();
+        const selected = selectedRef.current;
+        if (selected !== null) void loadDrilldown(selected);
+      }, 150);
+    };
+    const onFrame = (event: MessageEvent): void => {
+      let frame: BusFrame;
       try {
-        applySsePayload(store, JSON.parse(event.data as string) as SsePayload);
-        setSnapshot(store.getState());
+        frame = JSON.parse(event.data as string) as BusFrame;
       } catch {
         return;
       }
+      try {
+        applySsePayload(store, frame);
+      } catch {
+        return;
+      }
+      if (frame.type !== undefined && (BOARD_REFRESH_EVENTS.includes(frame.type) || frame.type === "worker.gates")) {
+        scheduleRefresh();
+      }
     };
+    for (const type of SSE_EVENT_TYPES) {
+      source.addEventListener(type, onFrame as EventListener);
+    }
     return () => {
+      if (pending !== null) clearTimeout(pending);
       source.close();
     };
-  }, [store]);
+  }, [store, refreshBoard, loadDrilldown]);
+
+  const diffs = selectedTaskId === null ? [] : (snapshot.diffs[selectedTaskId] ?? []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (selectedTaskId === null) {
+      setDisplayedSubjectHash(null);
+      return;
+    }
+    void subjectHashForHunks(diffs).then((hash) => {
+      if (!cancelled) setDisplayedSubjectHash(hash);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedTaskId, diffs]);
 
   async function selectTask(taskId: string): Promise<void> {
+    selectedRef.current = taskId;
     setSelectedTaskId(taskId);
     setSelectedFile(null);
     setTicket(null);
-    try {
-      const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/drilldown`);
-      if (!response.ok) return;
-      const view = (await response.json()) as {
-        session?: { sessionId?: string; status?: string; tier?: ModelTier };
-        stageGates?: Array<{ name: string; status: "pending" | "running" | "pass" | "fail" }>;
-        toolLog?: Array<{ seq: number; tool: string; input: string; output: string }>;
-        diffs?: DiffHunk[];
-      };
-      const card = store.getState().tasks.find((entry) => entry.id === taskId);
-      store.setDrilldown({
-        sessionId: view.session?.sessionId ?? `sess-${taskId}`,
-        taskId,
-        status: view.session?.status ?? card?.column ?? "running",
-        tier: view.session?.tier ?? store.getState().activeTier,
-        profile: "core",
-        stageGates: view.stageGates ?? [],
-        toolStream: (view.toolLog ?? []).map((entry) => ({
-          seq: entry.seq,
-          tool: entry.tool,
-          input: entry.input,
-          output: entry.output,
-          timestamp: new Date().toISOString(),
-        })),
-        tokens: 0,
-        cost: 0,
-      });
-      store.setDiff(taskId, view.diffs ?? []);
-      setSnapshot(store.getState());
-    } catch {
-      return;
-    }
+    await loadDrilldown(taskId);
   }
 
-  async function injectDag(spec: string): Promise<void> {
-    const titles = decomposeCharter(spec);
-    titles.forEach((title, index) => {
-      const id = `task-${Date.now()}-${index}`;
-      try {
-        store.upsertTask({
-          id,
-          title,
-          branch: `fleet/${id}`,
-          ownedPaths: [],
-          tier: store.getState().activeTier,
-          column: "Backlog",
-        });
-      } catch {
+  async function postDirector(message: string): Promise<void> {
+    setChatNotice(null);
+    try {
+      const response = await fetch("/api/director/message", {
+        method: "POST",
+        headers: jsonHeaders(csrfToken),
+        body: JSON.stringify({ message }),
+      });
+      const payload = (await response.json()) as { message?: DirectorMessageView; error?: string };
+      if (!response.ok) {
+        setChatNotice(payload.error ?? `director request failed with status ${response.status}`);
         return;
       }
-    });
-    setSnapshot(store.getState());
-    try {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      if (csrfToken !== undefined) headers["x-csrf-token"] = csrfToken;
-      const response = await fetch("/api/director/message", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ message: `/ship ${spec}` }),
-      });
-      if (!response.ok) return;
-      const payload = (await response.json()) as { message?: DirectorMessageView };
       if (payload.message !== undefined) {
-        setMessages((current) => [...current, payload.message as DirectorMessageView]);
+        const sent = payload.message;
+        setMessages((current) => (current.some((entry) => entry.seq === sent.seq) ? current : [...current, sent]));
       }
-    } catch {
-      return;
+      if (response.status === 202) setChatNotice("Director is thinking…");
+      await refreshBoard();
+    } catch (err) {
+      setChatNotice(`director request failed: ${(err as Error).message}`);
     }
   }
 
-  async function sendMessage(text: string): Promise<void> {
-    if (text.startsWith("/ship ")) {
-      await injectDag(text.slice("/ship ".length));
-      return;
-    }
+  async function mintTicket(taskId: string): Promise<void> {
     try {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      if (csrfToken !== undefined) headers["x-csrf-token"] = csrfToken;
-      const response = await fetch("/api/director/message", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ message: text }),
-      });
-      if (!response.ok) return;
-      const payload = (await response.json()) as { message?: DirectorMessageView };
-      if (payload.message !== undefined) {
-        setMessages((current) => [...current, payload.message as DirectorMessageView]);
-      }
-    } catch {
-      return;
-    }
-  }
-
-  async function mintTicket(taskId: string, subjectHash: string): Promise<void> {
-    try {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      if (csrfToken !== undefined) headers["x-csrf-token"] = csrfToken;
       const response = await fetch(`/api/approvals/${encodeURIComponent(taskId)}/ticket`, {
         method: "POST",
-        headers,
-        body: JSON.stringify({ subjectHash }),
+        headers: jsonHeaders(csrfToken),
+        body: "{}",
       });
-      if (!response.ok) return;
-      const payload = (await response.json()) as { ticket?: string };
-      if (typeof payload.ticket === "string") {
-        setTicket(payload.ticket);
+      const payload = (await response.json()) as ApprovalTicketView & { error?: string };
+      if (!response.ok) {
+        setBoardError(`fleet app: ticket refused: ${payload.error ?? response.status}`);
+        return;
       }
-    } catch {
-      return;
+      setTicket(payload);
+    } catch (err) {
+      setBoardError(`fleet app: ticket request failed: ${(err as Error).message}`);
     }
   }
 
   const drilldown = snapshot.drilldown;
-  const diffs = selectedTaskId === null ? [] : (snapshot.diffs[selectedTaskId] ?? []);
   const additions = diffs.reduce((sum, hunk) => sum + hunk.additions, 0);
   const deletions = diffs.reduce((sum, hunk) => sum + hunk.deletions, 0);
-  const subjectHash = selectedTaskId === null ? "" : `webui:${selectedTaskId}:${diffs.length}:${additions}:${deletions}`;
+  const selectedCard = snapshot.tasks.find((task) => task.id === selectedTaskId);
+  const lastMessage = messages.at(-1);
+  const thinking = chatNotice === "Director is thinking…" && lastMessage?.author === "human";
 
   return (
     <div style={{ backgroundColor: palette.appBg, color: palette.text, minHeight: "100vh" }}>
@@ -332,17 +368,11 @@ export function App(): JSX.Element {
         <span style={{ ...mutedStyle() }} data-testid="app-tier">
           {snapshot.activeTier}
         </span>
+        <span style={{ ...mutedStyle() }} data-testid="app-approvals">
+          {approvals === undefined ? "" : approvals.available ? `approvals: key ${approvals.fingerprint?.slice(0, 12) ?? ""}…` : "approvals disabled"}
+        </span>
         <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          <button type="button" data-testid="app-refresh-board" style={ghostButtonStyle()} onClick={() => void (async () => {
-            try {
-              const response = await fetch(BOARD_ENDPOINT);
-              if (!response.ok) return;
-              seedStoreFromBoard(store, (await response.json()) as BoardJson);
-              setSnapshot(store.getState());
-            } catch {
-              return;
-            }
-          })()}>
+          <button type="button" data-testid="app-refresh-board" style={ghostButtonStyle()} onClick={() => void refreshBoard()}>
             Refresh board
           </button>
         </span>
@@ -365,41 +395,50 @@ export function App(): JSX.Element {
             dagEdges={snapshot.dagEdges}
             onClose={() => {
               store.setDrilldown(null);
-              setSnapshot(store.getState());
+              selectedRef.current = null;
               setSelectedTaskId(null);
             }}
           />
           <SplitDiffViewer hunks={diffs} selectedFile={selectedFile} onSelectFile={setSelectedFile} />
-          {selectedTaskId !== null ? (
+          {selectedTaskId !== null && selectedCard?.column === "Waiting Approval / QA" ? (
             <ApprovalDrawer
               taskId={selectedTaskId}
-              subjectHash={subjectHash}
+              displayedSubjectHash={displayedSubjectHash}
               additions={additions}
               deletions={deletions}
               files={diffs.length}
               verdicts={gatesToVerdicts(drilldown?.stageGates ?? [])}
               ticket={ticket}
+              unavailableReason={approvals !== undefined && !approvals.available ? approvals.reason : null}
               csrfToken={csrfToken}
-              onApproved={(result) => {
-                store.moveCard(result.taskId, "Ready");
-                setSnapshot(store.getState());
+              onMintTicket={() => void mintTicket(selectedTaskId)}
+              onApproved={() => {
+                setTicket(null);
+                void refreshBoard();
+              }}
+              onRejected={() => {
+                setTicket(null);
+                void refreshBoard();
+              }}
+              onError={() => {
+                setTicket(null);
               }}
             />
           ) : null}
-          {selectedTaskId !== null && ticket === null ? (
-            <div>
-              <button
-                type="button"
-                data-testid="app-mint-ticket"
-                style={ghostButtonStyle()}
-                onClick={() => void mintTicket(selectedTaskId, subjectHash)}
-              >
-                Mint approval ticket
-              </button>
-            </div>
-          ) : null}
         </main>
-        <DirectorChat messages={messages} dock="right" onSend={(text) => void sendMessage(text)} onInjectDag={(spec) => void injectDag(spec)} />
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <DirectorChat
+            messages={messages}
+            dock="right"
+            onSend={(text) => void postDirector(text)}
+            onInjectDag={(spec) => void postDirector(`/ship ${spec}`)}
+          />
+          {chatNotice !== null && (chatNotice !== "Director is thinking…" || thinking) ? (
+            <p data-testid="director-notice" style={{ ...mutedStyle(), margin: 0 }}>
+              {chatNotice}
+            </p>
+          ) : null}
+        </div>
       </div>
     </div>
   );

@@ -11,15 +11,7 @@
   </head>
   <body>
     <div id="root"></div>
-    <script type="module">
-      import { App } from "/src/app.tsx";
-      import { createElement } from "react";
-      import { createRoot } from "react-dom/client";
-      const rootEl = document.getElementById("root");
-      if (rootEl !== null) {
-        createRoot(rootEl).render(createElement(App));
-      }
-    </script>
+    <script type="module" src="./src/main.tsx"></script>
     <noscript>Fleet Control Plane requires JavaScript.</noscript>
   </body>
 </html>

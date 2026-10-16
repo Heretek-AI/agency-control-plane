@@ -2,10 +2,21 @@
   "name": "@heretek-ai/agency-control-plane",
   "private": true,
   "version": "0.0.0",
-  "workspaces": ["dispatcher", "web"],
+  "workspaces": [
+    "dispatcher",
+    "web"
+  ],
   "scripts": {
     "check": "bun run --filter './dispatcher' check && bun run --filter './web' check",
-    "accept": "bash scripts/accept/wave-1.sh && bash scripts/accept/wave-2.sh && bash scripts/accept/wave-3.sh",
-    "test": "bun test"
+    "test": "bun test",
+    "build:web": "bun scripts/build-web.ts",
+    "e2e:ui": "bun scripts/e2e/ui-smoke.ts",
+    "keygen": "bun dispatcher/src/keygen.ts",
+    "dispatcher": "bun dispatcher/src/main.ts",
+    "serve": "bun scripts/build-web.ts && bun dispatcher/src/main.ts",
+    "accept": "bash scripts/accept/wave-1.sh && bash scripts/accept/wave-2.sh && bash scripts/accept/wave-3.sh && bash scripts/accept/wave-4.sh"
+  },
+  "devDependencies": {
+    "playwright-core": "1.56.1"
   }
 }

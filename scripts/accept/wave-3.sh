@@ -6,12 +6,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 echo "[wave-3] bun install"
-bun install
+bun install --frozen-lockfile --ignore-scripts
 
 echo "[wave-3] typecheck (dispatcher + web)"
 bun run check
 
-echo "[wave-3] unit tests (all 66 prior + new web tests)"
+echo "[wave-3] unit tests (dispatcher + web)"
 bun test
 
 echo "[wave-3] zero-stub grep (must print nothing)"
@@ -80,6 +80,10 @@ if grep -rn -E '^import .*store' web/src/security/approval-client.ts; then
 fi
 grep -q 'finally' web/src/security/approval-client.ts || { echo "[wave-3] FAIL: no finally zeroing in approval-client" >&2; exit 1; }
 grep -q 'secret = null' web/src/security/approval-client.ts || { echo "[wave-3] FAIL: closure secret is never nulled" >&2; exit 1; }
+if grep -rn -E "from ['\"]node:|\bBuffer\b" web/src; then
+  echo "[wave-3] FAIL: browser sources use Node built-ins" >&2
+  exit 1
+fi
 echo "[wave-3] I1 static probe passed"
 
 echo "[wave-3] web behavior probe"
@@ -92,7 +96,12 @@ import { DirectorChat } from "./src/components/DirectorChat.tsx";
 import { KanbanBoard } from "./src/components/KanbanBoard.tsx";
 import { SplitDiffViewer } from "./src/components/SplitDiffViewer.tsx";
 import { WorkerDrillDown } from "./src/components/WorkerDrillDown.tsx";
-import { activeApprovalSecrets, approveWithPassphrase, assertNoPassphraseLeak } from "./src/security/approval-client.ts";
+import { activeApprovalSecrets, approveWithKeyFile, assertNoPassphraseLeak } from "./src/security/approval-client.ts";
+import { sealHumanKey } from "../dispatcher/src/human-key.ts";
+import { createServer } from "../dispatcher/src/server.ts";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createFleetStore } from "./src/state/fleet-store.ts";
 
 // store: board seed, move, drill-down, SSE tool event, diff, tier
@@ -113,10 +122,10 @@ store.setDrilldown({
   sessionId: "sess-task-101", taskId: "task-101", status: "running", tier: "tier-1-opencode",
   profile: "core", stageGates: [{ name: "verify", status: "pass" }], toolStream: [], tokens: 10, cost: 0.001,
 });
-applySsePayload(store, { topic: "worker.tool", taskId: "task-101", tool: "read", input: "a", output: "b" });
+applySsePayload(store, { type: "worker.tool", data: { taskId: "task-101", tool: "read", input: "a", output: "b" } });
 if (store.getState().drilldown?.toolStream.length !== 1) throw new Error("SSE tool event failed");
 store.setDiff("task-101", [{ file: "a.ts", status: "modified", additions: 1, deletions: 1, patch: "-x\n+y" }]);
-applySsePayload(store, { topic: "tier.fallback", targetTier: "tier-2-commercial" });
+applySsePayload(store, { type: "tier.fallback", data: { targetTier: "tier-2-commercial" } });
 if (store.getState().activeTier !== "tier-2-commercial") throw new Error("tier fallback failed");
 
 // all five pillars render to static markup
@@ -127,27 +136,38 @@ const pillars = [
   renderToStaticMarkup(createElement(WorkerDrillDown, { worker: state.drilldown, dagEdges: state.dagEdges })),
   renderToStaticMarkup(createElement(SplitDiffViewer, { hunks: state.diffs["task-101"] ?? [] })),
   renderToStaticMarkup(createElement(ApprovalDrawer, {
-    taskId: "task-104", subjectHash: "probe-hash", additions: 1, deletions: 1, files: 1,
+    taskId: "task-104", displayedSubjectHash: "probe-hash", additions: 1, deletions: 1, files: 1,
     verdicts: [
       { suite: "qa-functional", status: "pass", detail: "green" },
       { suite: "qa-adversarial", status: "pending", detail: "queued" },
     ],
-    ticket: "ticket-probe",
+    ticket: null,
   })),
 ];
 for (const marker of ["Fleet Kanban", "Director", "sess-task-101", "diff-file-tree", "approval-drawer"]) {
   if (!pillars.some((html) => html.includes(marker))) throw new Error(`pillar marker missing: ${marker}`);
 }
 
-// I1 runtime probe: secret never leaves the closure
+// I1 runtime probe: WebCrypto signing against a real dispatcher; secret never leaves the closure
 const secret = "probe-secret-303";
+const keyDir = mkdtempSync(join(tmpdir(), "wave3-key-"));
+sealHumanKey(keyDir, secret);
+const app = createServer({ humanPublicKeyPath: join(keyDir, "human.pub") });
+app.upsertTask({ id: "task-104", status: "waitingHuman", title: "Human gate" });
+app.recordDiff("task-104", [{ file: "a.ts", status: "modified", additions: 1, deletions: 1, patch: "diff --git a/a.ts b/a.ts\n-x\n+y" }]);
+const ticket = await (await app.fetch(new Request("http://127.0.0.1/api/approvals/task-104/ticket", {
+  method: "POST", headers: { "x-csrf-token": app.csrfToken }, body: "{}",
+}))).json();
 let seen = "";
-const fakeFetch = async (url, init) => {
-  seen = typeof init?.body === "string" ? init.body : "";
-  return new Response(JSON.stringify({ taskId: "task-104", status: "ready", subjectHash: "probe-hash" }), { status: 200 });
+const routed = async (url, init) => {
+  seen += init?.body ?? "";
+  return app.fetch(new Request(`http://127.0.0.1${url}`, { method: "POST", headers: { ...init.headers, "x-csrf-token": app.csrfToken }, body: init.body }));
 };
-await approveWithPassphrase("task-104", "ticket-probe", secret, "probe-hash", { fetchImpl: fakeFetch });
+const keyBytes = new Uint8Array(readFileSync(join(keyDir, "human.key.enc")));
+const result = await approveWithKeyFile("task-104", ticket, keyBytes, secret, { fetchImpl: routed });
+if (result.status !== "done") throw new Error("browser-side signature was not accepted");
 if (seen.includes(secret)) throw new Error("passphrase leaked onto the wire");
+if (!keyBytes.every((b) => b === 0)) throw new Error("key file bytes not zeroed");
 if (activeApprovalSecrets() !== 0) throw new Error("closure secret not zeroed");
 const probe = assertNoPassphraseLeak(secret, {
   storeSnapshot: store.getState(),
