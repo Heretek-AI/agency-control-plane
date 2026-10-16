@@ -1,0 +1,263 @@
+# Wave 2 QA Red-Proof Log — agency-control-plane
+
+- Stage: wave-2 (Crash-Safe Worktrees, Transactional Landing & HTTP/SSE Control Server)
+- Branch: `wave-2-worktrees-server`
+- Worktree: `/home/john/Projects/Heretek-AI-Rebuild/agency-control-plane-wave-2`
+- QA agent: `agency-qa` (Muse Spark 1.3 Contributor)
+- Date (UTC): 2026-10-16
+- Commit under test: `943bb1b` + wave-2 work (see `git log`; tree clean except this evidence file)
+
+This log records: (1) full acceptance execution, (2) zero-stub + scope checks,
+(3) three red-proof sabotages — each PROVEN to FAIL when broken and PASS when
+restored via `git checkout -- <file>` — and (4) the final green state.
+Nothing was committed by QA. No subagents were spawned.
+
+---
+
+## 1. ACCEPTANCE — `make check` equivalent
+
+### 1a. `bun install`
+```
+bun install v1.4.2 (744846f84)
+Done! Checked 10 packages (no changes)
+EXIT: 0
+```
+
+### 1b. `bun run check` (typecheck + lint, dispatcher + web)
+```
+@heretek-ai/agency-dispatcher check: Exited with code 0
+@heretek-ai/agency-web check: agency-web: no sources yet
+@heretek-ai/agency-web check: Exited with code 0
+EXIT: 0
+```
+Zero warnings, zero errors.
+
+### 1c. `bun test` (full suite)
+```
+bun test v1.4.2 (744846f84)
+
+ 66 pass
+ 0 fail
+ 185 expect() calls
+Ran 66 tests across 4 files.
+EXIT: 0
+```
+34 Wave-1 tests (scheduler + limits) + 32 Wave-2 tests
+(server-api 20 + worktrees-landing 12) — matches the 66-pass expectation.
+
+---
+
+## 2. ACCEPTANCE — wave scripts
+
+### 2a. `bash scripts/accept/wave-2.sh` → EXIT 0
+```
+[wave-2] bun install            ... ok
+[wave-2] typecheck dispatcher   ... ok
+[wave-2] unit tests             ... 66 pass, 0 fail
+[wave-2] zero-stub grep (must print nothing) ... clean
+[wave-2] required deliverables present        ... all present
+[wave-2] worktrees + landing + tickets behavior probe
+[wave-2] behavior probe passed
+[wave-2] PASS
+```
+
+### 2b. `bash scripts/accept/wave-1.sh` (no-regression) → EXIT 0
+```
+[wave-1] bun install            ... ok
+[wave-1] typecheck dispatcher   ... ok
+[wave-1] unit tests             ... 66 pass, 0 fail
+[wave-1] zero-stub grep (must print nothing) ... clean
+[wave-1] required deliverables present        ... all present
+[wave-1] scheduler + limits behavior probe
+[wave-1] behavior probe passed
+[wave-1] PASS
+```
+
+---
+
+## 3. ZERO-STUB GREP + SCOPE CHECK
+
+Zero-stub grep (TODO|FIXME|XXX|HACK|not implemented|echo "passed"||| true|
+`return true;`|empty catch, plus `set +e` in the accept script):
+```
+(clean: no matches)
+```
+Note: `scripts/accept/wave-2.sh` builds its stub patterns via obfuscated
+concatenation (`W1='TO'"DO"` etc.) so the script itself never literally
+matches; the executed grep over `dispatcher/` + the script reports nothing.
+
+Scope / forbidden-content grep (`swarmos|src/omni|swarmos-plugin|ASTParser|
+domain MCP tools`) over `dispatcher/` + `web/`:
+- Only hits: `dispatcher/test/scheduler.test.ts:106-107` use the STRINGS
+  `"src/omni/*"` / `"src/omni/graph.ts"` as fixture path data for the
+  `pathsOverlap` serialization test — not SwarmOS code, no `src/omni`
+  directory exists, no `swarmos-plugin.ts` exists. No AST parsers, no MCP
+  tools anywhere in the tree.
+- `web/` is untouched by Wave 2 (only Wave-1 workspace configs
+  `web/package.json` + `web/tsconfig.json` exist there; `git status --short
+  web/` clean, no source files added). Invariant I1 is a Wave-3 concern;
+  nothing in `web/` stores passphrases today (no approval code exists yet).
+
+---
+
+## 4. RED-PROOF SABOTAGE A — ticket single-use
+
+Condition asserted: `TicketStore.verifyTicket` is consume-on-verify — the
+first call returns the binding, the second call throws `reused-ticket`.
+
+Sabotage (minimal, in `dispatcher/src/approval-tickets.ts::verifyTicket`):
+removed the `record.used = true;` burn so reuse succeeds.
+```diff
+diff --git a/dispatcher/src/approval-tickets.ts b/dispatcher/src/approval-tickets.ts
+@@ -115,7 +115,7 @@ export class TicketStore {
+       this.tickets.delete(token);
+       throw new TicketError("expired-ticket", "approval ticket has expired");
+     }
+-    record.used = true;
++    // SABOTAGE-A: consume-on-verify disabled (red-proof)
+     return { taskId: record.taskId, subjectHash: record.subjectHash };
+```
+
+Failing run: `bun test dispatcher/test/server-api.test.ts` → EXIT 1
+```
+ 171 |   test("verifyTicket consumes on first use and rejects reuse", () => {
+ ...
+ 176 |     expect(() => store.verifyTicket(token)).toThrow(/already been used/);
+                                                   ^
+ error: expect(received).toThrow(expected)
+ Expected pattern: /already been used/
+ Received function did not throw
+ (fail) approval tickets: single-use + TTL > verifyTicket consumes on first use and rejects reuse
+  19 pass
+  1 fail
+  69 expect() calls
+ Ran 20 tests across 1 file.
+```
+→ Check is NOT vacuous: breaking single-use turns the suite red.
+
+Restore: `git checkout -- dispatcher/src/approval-tickets.ts` → `RESTORED`,
+`git status --short` → clean (empty).
+Post-restore: `bun test dispatcher/test/server-api.test.ts` → EXIT 0,
+`20 pass, 0 fail`. → PASS when restored.
+
+---
+
+## 5. RED-PROOF SABOTAGE B — landing rollback
+
+Condition asserted: `landTask` with a red post-merge verification rolls the
+integration branch back to the recorded pre-merge SHA with `reset --hard`
+(`rolledBack: true`, tip equals pre-merge SHA).
+
+Sabotage (minimal, in `dispatcher/src/landing.ts::landTask` verify-failure
+branch): skipped the `reset --hard preMergeSha` rollback.
+```diff
+diff --git a/dispatcher/src/landing.ts b/dispatcher/src/landing.ts
+@@ -210,7 +210,7 @@ export async function landTask(input: LandTaskInput): Promise<LandResult> {
+         reason = `verify threw: ${(err as Error).message}`;
+       }
+       if (!passed) {
+-        runGit(dir, ["reset", "--hard", preMergeSha]);
++        // SABOTAGE-B: rollback skipped (red-proof)
+         input.audit?.("landing.reset", {
+```
+
+Failing run: `bun test dispatcher/test/worktrees-landing.test.ts` → EXIT 1
+```
+ 257 |     expect(result.rolledBack).toBe(true);
+ 258 |     expect(git(repo, ["rev-parse", "fleet/integration/m-2"])).toBe(preMerge);
+                                                                     ^
+ error: expect(received).toBe(expected)
+ Expected: "5d8ff0437ead174f15a911e07a8e5b0b0d1b4351"
+ Received: "0b77e37c70315308bff539db82220eae70e74e2b"
+ (fail) landTask transactional landing > failed post-merge verification rolls back to the pre-merge SHA
+  11 pass
+  1 fail
+  52 expect() calls
+ Ran 12 tests across 1 file.
+```
+The integration branch is left sitting on the bad merge commit — exactly the
+data-corruption outcome the rollback exists to prevent — and the test catches
+it. → Check is NOT vacuous.
+
+Restore: `git checkout -- dispatcher/src/landing.ts` → `RESTORED`,
+`git status --short` → clean (empty).
+Post-restore: `bun test dispatcher/test/worktrees-landing.test.ts` → EXIT 0,
+`12 pass, 0 fail`. → PASS when restored.
+
+---
+
+## 6. RED-PROOF SABOTAGE C — SSE replay gap marker
+
+Condition asserted: `EventBus.replaySince` (surfaced via
+`GET /api/events?snapshot=1`) emits a `fleet.gap` sequence-gap marker when
+replay starts before the oldest buffered event after ring-buffer overflow,
+so consumers detect the hole instead of silently missing history.
+
+Sabotage (minimal, in `dispatcher/src/event-bus.ts::replaySince`): forced
+`gap` to `null`, suppressing the marker.
+```diff
+diff --git a/dispatcher/src/event-bus.ts b/dispatcher/src/event-bus.ts
+@@ -130,11 +130,8 @@ export class EventBus {
+   replaySince(fromSeq: number): EventReplay {
+     const start = Number.isFinite(fromSeq) ? Math.floor(fromSeq) : 1;
+     const events = this.buffer.filter((event) => event.seq >= start);
+-    const oldest = this.oldestSeq();
+-    const gap: SequenceGap | null =
+-      this.dropped > 0 && start < oldest
+-        ? { fromSeq: start, toSeq: oldest - 1, dropped: Math.min(this.dropped, oldest - start) }
+-        : null;
++    // SABOTAGE-C: gap marker suppressed (red-proof)
++    const gap: SequenceGap | null = null;
+     return { events, gap };
+```
+
+Failing run: `bun test dispatcher/test/server-api.test.ts` → EXIT 1
+```
+ 360 |     expect(body).toContain("event: fleet.gap");
+                        ^
+ error: expect(received).toContain(expected)
+ Expected to contain: "event: fleet.gap"
+ Received: "id: 3\nevent: probe\ndata: {...seq 3...}id: 4\nevent: probe\ndata: {...seq 4...}id: 5\nevent: probe\ndata: {...seq 5...}"
+ (fail) GET /api/events SSE > snapshot replays from Last-Event-ID with a gap marker after overflow
+  19 pass
+  1 fail
+  66 expect() calls
+ Ran 20 tests across 1 file.
+```
+→ Check is NOT vacuous: a silent-history-hole bus turns the suite red.
+
+Restore: `git checkout -- dispatcher/src/event-bus.ts` → `RESTORED`,
+`git status --short` → clean (empty).
+Post-restore: `bun test dispatcher/test/server-api.test.ts` → EXIT 0,
+`20 pass, 0 fail`. → PASS when restored.
+
+---
+
+## 7. FINAL GREEN + CLEAN HANDOFF
+
+After all three sabotage/restore cycles:
+- `bun run check` → EXIT 0 (dispatcher 0, web "no sources yet" 0).
+- `bun test` → `66 pass, 0 fail, 185 expect() calls, Ran 66 tests across 4 files`.
+- `git status --short` → clean (no uncommitted code or test modifications;
+  only this new evidence file `docs/evidence/wave-2/red-proofs.log` present
+  as untracked, which the handoff gate explicitly permits).
+- `git stash list` → empty. No commits made by QA (`git log` head unchanged).
+
+Minor observation (non-blocking, for Drift Guard): `docs/reports/wave-2.md`
+says `worktrees-landing.test.ts` has "13 tests" — the file contains 12
+(4 two-phase + 2 cleanup + 2 salvage + 4 landing = 12; 20 server-api + 12 =
+32 Wave-2 tests; 34 + 32 = 66 total, consistent). Report count is off by one;
+test evidence itself is green and complete.
+
+## QA VERDICT
+
+- Acceptance: wave-2.sh PASS, wave-1.sh PASS (no regression), `make check`
+  green with 66/66 tests passing.
+- Zero stubs, zero TODOs, no scope violations (`web/` untouched by Wave 2,
+  no SwarmOS/AST/MCP material).
+- Red-proofs: A (ticket single-use), B (landing rollback), C (SSE gap
+  marker) — each demonstrated FAIL-when-broken (exit 1, exactly the
+  guarding test red) and PASS-when-restored (exit 0, full file green),
+  each restored via `git checkout --` with `git status --short` verified
+  clean immediately after.
+- Handoff is clean. Ready for Drift Guard review.
