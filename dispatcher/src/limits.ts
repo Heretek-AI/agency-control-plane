@@ -88,7 +88,8 @@ export function extractRetryAfterMs(
   return fallback;
 }
 
-function isQuotaFailure(failure: ProviderFailure): boolean {
+/** True for usage-limit / quota / payment failures (the shapes that route to the next tier). */
+export function isQuotaFailure(failure: ProviderFailure): boolean {
   const codeQuota = failure.code !== undefined && QUOTA_CODE_PATTERN.test(failure.code);
   const messageQuota = QUOTA_MESSAGE_PATTERN.test(failure.message ?? "");
   return failure.status === 402 || codeQuota || messageQuota;

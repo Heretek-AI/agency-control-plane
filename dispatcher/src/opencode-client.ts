@@ -11,7 +11,7 @@
  * 2. parses the listening URL from stdout (`server listening on <url>`,
  *    or the `--stdio` form `{"url": ...}`);
  * 3. talks to the v2 API with HTTP Basic auth (`opencode:<password>`):
- *    - `POST /api/session` `{ location: { directory }, agent?, title? }` -> `{ data: { id } }`
+ *    - `POST /api/session` `{ location: { directory }, agent?, title?, model? }` -> `{ data: { id } }`
  *    - `POST /api/session/:id/prompt` `{ text }` (durably admits the input and schedules the agent loop)
  *    - `GET  /api/event` SSE, one `data: <json>` frame per event
  *      (`session.tool.*`, `session.text.ended`, `session.status`,
@@ -30,9 +30,23 @@ export interface WorkerEvent {
   data: Record<string, unknown>;
 }
 
+/** OpenCode v2 `Model.Ref`: which provider model a session runs on. */
+export interface ModelRef {
+  providerID: string;
+  id: string;
+  variant?: string | undefined;
+}
+
+export interface CreateSessionInput {
+  directory: string;
+  agent?: string | undefined;
+  title?: string | undefined;
+  model?: ModelRef | undefined;
+}
+
 /** The slice of the OpenCode v2 API the dispatcher uses. */
 export interface WorkerApi {
-  createSession(input: { directory: string; agent?: string | undefined; title?: string | undefined }): Promise<{ id: string }>;
+  createSession(input: CreateSessionInput): Promise<{ id: string }>;
   prompt(sessionId: string, text: string): Promise<void>;
   /** Open the event stream. Resolves once the stream is connected; events flow to `onEvent` until `signal` aborts or the stream ends. */
   subscribe(onEvent: (event: WorkerEvent) => void, signal: AbortSignal): Promise<{ closed: Promise<void> }>;
@@ -70,10 +84,11 @@ export class OpencodeHttpClient implements WorkerApi {
     }
   }
 
-  async createSession(input: { directory: string; agent?: string | undefined; title?: string | undefined }): Promise<{ id: string }> {
+  async createSession(input: CreateSessionInput): Promise<{ id: string }> {
     const payload: Record<string, unknown> = { location: { directory: input.directory } };
     if (input.agent !== undefined) payload["agent"] = input.agent;
     if (input.title !== undefined) payload["title"] = input.title;
+    if (input.model !== undefined) payload["model"] = input.model;
     const result = (await this.request("POST", "/api/session", payload)) as { data?: { id?: unknown } } | null;
     const id = result?.data?.id;
     if (typeof id !== "string" || id.length === 0) {

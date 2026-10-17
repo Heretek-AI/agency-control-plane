@@ -13,11 +13,16 @@
  *   `[crash]` exits the process, `[hang]` never finishes, `[noop]`
  *   succeeds without touching files; otherwise the worker writes
  *   `fleet-output/<session>.txt` in its cwd via a `write` tool call.
+ *   A session created on model id `quota-exhausted` fails every prompt
+ *   with a quota-shaped provider error (tier failover tests).
+ * - Every prompt is recorded in `<dir of $OPENCODE_DB>/fake-prompts.jsonl`
+ *   with the session's agent, model, `XDG_CONFIG_HOME`, and text, so tests
+ *   can assert what a worker was started with.
  * - Director sessions (agent `director`) reply with a valid ```tasks
  *   block when asked to "plan", an invalid one for "bad plan", and plain
  *   text otherwise; every reply states the turn number.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const password = process.env["OPENCODE_SERVER_PASSWORD"] ?? "";
@@ -30,6 +35,7 @@ if (dbPath !== undefined) {
 interface FakeSession {
   id: string;
   agent: string | undefined;
+  model: { providerID?: string; id?: string } | undefined;
   directory: string;
   turns: number;
 }
@@ -82,6 +88,11 @@ async function runWorker(session: FakeSession, text: string): Promise<void> {
     process.exit(7);
   }
   if (text.includes("[hang]")) return;
+  if (session.model?.id === "quota-exhausted") {
+    await sleep(5);
+    emit("session.execution.failed", { sessionID, error: { type: "provider", message: "GoUsageLimitError: usage limit reached" } });
+    return;
+  }
   if (text.includes("[fail]")) {
     await sleep(5);
     emit("session.execution.failed", { sessionID, error: { type: "provider", message: "model exploded" } });
@@ -127,13 +138,13 @@ const server = Bun.serve({
       return new Response(stream, { headers: { "content-type": "text/event-stream" } });
     }
     if (req.method === "POST" && url.pathname === "/api/session") {
-      const body = (await req.json()) as { location?: { directory?: string }; agent?: string };
+      const body = (await req.json()) as { location?: { directory?: string }; agent?: string; model?: FakeSession["model"] };
       const directory = body.location?.directory;
       if (typeof directory !== "string" || !path.isAbsolute(directory)) {
         return Response.json({ error: "location.directory must be absolute" }, { status: 400 });
       }
       const id = `ses_${sessions.size + 1}_${process.pid}`;
-      sessions.set(id, { id, agent: body.agent, directory, turns: 0 });
+      sessions.set(id, { id, agent: body.agent, model: body.model, directory, turns: 0 });
       return Response.json({ data: { id, agent: body.agent ?? null, location: { directory } } });
     }
     const prompt = /^\/api\/session\/([^/]+)\/prompt$/.exec(url.pathname);
@@ -146,6 +157,10 @@ const server = Bun.serve({
       }
       session.turns += 1;
       const text = body.text;
+      if (dbPath !== undefined) {
+        const record = { session: session.id, agent: session.agent ?? null, model: session.model ?? null, xdg: process.env["XDG_CONFIG_HOME"] ?? null, text };
+        appendFileSync(path.join(path.dirname(dbPath), "fake-prompts.jsonl"), `${JSON.stringify(record)}\n`);
+      }
       setTimeout(() => {
         emit("session.execution.started", { sessionID: session.id });
         emit("session.status", { sessionID: session.id, status: { type: "busy" } });

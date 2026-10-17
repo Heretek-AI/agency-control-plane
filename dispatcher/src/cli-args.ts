@@ -1,3 +1,5 @@
+import type { ModelTier } from "./limits.js";
+
 /**
  * Minimal `--flag value` / `--flag=value` / `--switch` parser shared by the CLIs.
  * Names in `knownSwitches` take no operand; every other flag requires one.
@@ -48,4 +50,29 @@ export function parseCommand(value: string): string[] {
   const parts = trimmed.split(/\s+/).filter((part) => part.length > 0);
   if (parts.length === 0) throw new Error("command must not be empty");
   return parts;
+}
+
+const TIERS: readonly ModelTier[] = ["tier-1-opencode", "tier-2-commercial", "tier-3-local"];
+
+/** Parse `--tier-models` JSON: an object from tier name to `provider/model`. */
+export function parseTierModels(value: string | undefined): Partial<Record<ModelTier, string>> | undefined {
+  if (value === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (err) {
+    throw new Error(`--tier-models must be JSON: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("--tier-models must be a JSON object of tier -> provider/model");
+  }
+  const models: Partial<Record<ModelTier, string>> = {};
+  for (const [tier, model] of Object.entries(parsed)) {
+    if (!TIERS.includes(tier as ModelTier)) throw new Error(`--tier-models: unknown tier ${JSON.stringify(tier)}`);
+    if (typeof model !== "string" || !/^[^/#]+\/[^#]+(#.+)?$/.test(model)) {
+      throw new Error(`--tier-models: ${tier} must map to "provider/model", got ${JSON.stringify(model)}`);
+    }
+    models[tier as ModelTier] = model;
+  }
+  return models;
 }

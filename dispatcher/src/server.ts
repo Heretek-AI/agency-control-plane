@@ -19,8 +19,11 @@
  *   returns the exact es-core-compatible payloads to sign.
  * - `POST /api/approvals/:taskId/sign` — burn the ticket, recompute the
  *   diff hash, and verify the Ed25519 signature against the PINNED human
- *   key (`human.pub`) only; `waitingHuman` -> `done` (APPROVE) or
- *   `failed` (REJECT); audit-chained with the full signed record.
+ *   key (`human.pub`) only. APPROVE lands `fleet/<taskId>` onto the
+ *   mission's integration branch (`landing.ts`) and moves the task to
+ *   `done` with its `landedSha`; a landing conflict keeps it
+ *   `waitingHuman` (409, conflicting files listed). REJECT -> `failed`.
+ *   Audit-chained with the full signed record.
  * - `GET /api/events` — SSE stream with `Last-Event-ID` replay.
  * - `GET /api/csrf` — issue the CSRF token POST routes require.
  * - `GET /*` — the built WebUI (`web/dist`) when `webDistDir` is set.
@@ -29,6 +32,10 @@
  * matching `x-csrf-token` → 403; no pinned human key → 503 on approval
  * routes; unknown/expired/reused/mismatched tickets → 403; bad
  * signatures → 403; approving a task that is not `waitingHuman` → 409.
+ *
+ * Worktree lifecycle: a task reaching `done` / `failed` / `cancelled`
+ * releases its worktree once no worker runs in it; `failed` and
+ * `cancelled` branches are then salvaged to `refs/fleet-salvage/<id>`.
  */
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, statSync } from "node:fs";
@@ -47,19 +54,31 @@ import {
   type ApprovalPayload,
   type PinnedHumanKey,
 } from "./human-key.js";
-import { classifyProviderFailure, type ModelTier, type ProviderFailure } from "./limits.js";
+import { landTask, type LandResult } from "./landing.js";
+import { classifyProviderFailure, type ModelTier, type ProviderDisposition, type ProviderFailure } from "./limits.js";
 import { TaskSchema, TaskStatuses, type Task, type TaskStatus } from "./model.js";
 import { attachBusToNats, type NatsJetStreamBridge } from "./nats-bridge.js";
 import { DEFAULT_WORKER_COMMAND } from "./opencode-client.js";
 import { schedule } from "./scheduler.js";
 import { WorkerLauncher } from "./worker-launcher.js";
 import type { WorkerClientFactory } from "./worker-session.js";
-import { WorktreeStore, cleanupUnconfirmed, runGit, type WorktreeState } from "./worktrees.js";
+import {
+  WorktreeStore,
+  cleanupUnconfirmed,
+  integrationBranch,
+  releaseWorktree,
+  runGit,
+  salvageWorktree,
+  type WorktreeState,
+} from "./worktrees.js";
 
 export const LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "localhost", "::1"] as const;
 export const CSRF_HEADER = "x-csrf-token";
 export const SCHEDULER_FLEET_CAP = 4;
 export const MAX_TASKS_PER_MESSAGE = 50;
+
+/** Statuses after which a task never runs again: its worktree is released. */
+const FINISHED: ReadonlySet<TaskStatus> = new Set<TaskStatus>(["done", "failed", "cancelled"]);
 
 export type BoardColumn = "Backlog" | "Ready" | "In Progress" | "Waiting Approval / QA" | "Done";
 
@@ -98,7 +117,8 @@ export interface WorktreeStatusView {
   taskId: string;
   branch: string;
   path: string;
-  state: WorktreeState;
+  /** `released`: the task finished and its worktree was removed. */
+  state: WorktreeState | "released";
 }
 
 export interface DagEdge {
@@ -187,6 +207,10 @@ export interface WorkerConfig {
   startTimeoutMs?: number | undefined;
   taskTimeoutMs?: number | undefined;
   perExpertCap?: number | undefined;
+  /** Role packs for `expert` tasks (`<rolesDir>/<role-id>/`, see `roles.ts`). */
+  rolesDir?: string | undefined;
+  /** `provider/model` per model tier; tier failover switches new sessions to the next tier's model. */
+  tierModels?: Partial<Record<ModelTier, string>> | undefined;
   env?: Record<string, string | undefined> | undefined;
   clientFactory?: WorkerClientFactory | undefined;
 }
@@ -234,7 +258,7 @@ export interface FleetServer {
   getTask(id: string): Task | undefined;
   upsertTask(input: UpsertTaskInput): Task;
   setTier(tier: ModelTier): void;
-  reportProviderFailure(failure: ProviderFailure): { action: string };
+  reportProviderFailure(failure: ProviderFailure): ProviderDisposition;
   reportProviderSuccess(): void;
   consecutiveFailures(): number;
   updateTask(id: string, patch: Partial<Task>): Task;
@@ -446,6 +470,8 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
   let worktreeStore: WorktreeStore | null = null;
   let natsBridge: NatsJetStreamBridge | null = null;
   let detachNats: (() => void) | null = null;
+  // Landings onto shared integration branches run one at a time.
+  let landingQueue: Promise<unknown> = Promise.resolve();
 
   const boardStore = stateDir !== undefined ? new BoardStore(join(stateDir, "dispatcher.db")) : null;
 
@@ -593,8 +619,67 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
     storeTask(task);
     if (task.status !== existing.status) {
       bus.publish("task.updated", { taskId: id, status: task.status, reason: task.reason ?? null });
+      releaseIfFinished(id);
     }
     return task;
+  }
+
+  /**
+   * Release a finished task's worktree, then salvage the branch of a task
+   * that did not succeed. Never throws: failures are audited and published
+   * so a stuck worktree cannot wedge a status change.
+   */
+  function releaseIfFinished(taskId: string): void {
+    const task = tasks.get(taskId);
+    if (repoDir === undefined || worktreeStore === null || task === undefined || !FINISHED.has(task.status)) return;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(taskId)) return;
+    // A worker still running in the tree: released when its run settles.
+    if (launcher?.runningIds().includes(taskId) === true) return;
+    const store = worktreeStore;
+    const record = store.get(taskId);
+    try {
+      if (record !== undefined && record.state !== "salvage") {
+        try {
+          releaseWorktree({ repoDir, taskId, store });
+        } catch (err) {
+          if (existsSync(record.path)) throw err;
+          // The directory is already gone: drop the stale registration.
+          runGit(repoDir, ["worktree", "prune"]);
+          store.remove(taskId);
+        }
+        audit("worktree.released", { taskId, path: record.path, status: task.status });
+        bus.publish("worktree.released", { taskId, status: task.status });
+      }
+      if (task.status !== TaskStatuses.done) {
+        const salvaged = salvageWorktree({ repoDir, taskId, store });
+        if (salvaged !== undefined) {
+          audit("worktree.salvaged", { taskId, ref: salvaged.ref, tip: salvaged.tip });
+          bus.publish("worktree.salvaged", { taskId, ref: salvaged.ref, tip: salvaged.tip });
+        }
+      }
+    } catch (err) {
+      audit("worktree.release-failed", { taskId, error: (err as Error).message });
+      bus.publish("worktree.release-failed", { taskId, error: (err as Error).message });
+    }
+  }
+
+  function reportProviderFailure(failure: ProviderFailure): ProviderDisposition {
+    failures += 1;
+    const disposition = classifyProviderFailure(failure, failures, activeTier);
+    if (disposition.action === "route-fallback") {
+      activeTier = disposition.targetTier;
+      failures = 0;
+      audit("tier.fallback", { targetTier: activeTier });
+      bus.publish("tier.fallback", { targetTier: activeTier });
+    } else if (disposition.action === "pause-missions") {
+      const resumeAtMs = Date.now() + disposition.resumeAfterMs;
+      launcher?.pauseUntil(resumeAtMs);
+      audit("missions.paused", { reason: disposition.reason, resumeAtMs });
+      bus.publish("missions.paused", { reason: disposition.reason, resumeAtMs });
+    } else {
+      bus.publish("provider.retry", { action: disposition.action, delayMs: disposition.delayMs });
+    }
+    return disposition;
   }
 
   function getBoard(): BoardView {
@@ -614,7 +699,7 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
         taskId: task.id,
         branch: stored?.branch ?? task.branch ?? `fleet/${task.id}`,
         path: stored?.path ?? task.worktree ?? "",
-        state: stored?.state ?? "allocated",
+        state: stored?.state ?? (FINISHED.has(task.status) && task.worktree !== undefined ? "released" : "allocated"),
       });
     }
     const dagEdges: DagEdge[] = [];
@@ -760,6 +845,9 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
             bus.publish(type, data);
           },
           audit,
+          onRunSettled: releaseIfFinished,
+          activeTier: () => activeTier,
+          reportProviderFailure,
         },
         {
           repoDir,
@@ -768,6 +856,8 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
           command: workerCommand,
           caps: perExpertCap === undefined ? { fleet: fleetCap } : { fleet: fleetCap, perExpert: () => perExpertCap },
           agent: workerConfig.agent,
+          rolesDir: workerConfig.rolesDir === undefined ? undefined : resolve(workerConfig.rolesDir),
+          tierModels: workerConfig.tierModels,
           startTimeoutMs: workerConfig.startTimeoutMs,
           taskTimeoutMs: workerConfig.taskTimeoutMs,
           env: workerConfig.env,
@@ -790,6 +880,11 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
         clientFactory: directorConfig.clientFactory,
       });
     }
+  }
+
+  // Finished tasks whose worktree outlived the previous process.
+  if (worktreeStore !== null) {
+    for (const record of worktreeStore.list()) releaseIfFinished(record.taskId);
   }
 
   function handleEvents(req: Request): Response {
@@ -1056,15 +1151,70 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
     if (task.status !== TaskStatuses.waitingHuman) {
       return fail(409, `task ${JSON.stringify(taskId)} is ${task.status}, only waitingHuman tasks can be signed`);
     }
+    const signed = signedRecord(humanKey, payload, signatureHex as string);
+    let landedSha: string | undefined;
+    if (approve && repoDir !== undefined && stateDir !== undefined) {
+      const integration = missions.get(task.missionId)?.integrationBranch ?? integrationBranch(task.missionId);
+      const landed = await landApproved(task.id, integration);
+      if (landed === null) {
+        return fail(409, `task ${JSON.stringify(taskId)} changed state while landing was queued`);
+      }
+      if (!landed.ok) {
+        const files = landed.files ?? [];
+        const reason =
+          landed.reason === "conflict"
+            ? `approved, but landing on ${integration} conflicts in: ${files.join(", ")}`
+            : `approved, but landing on ${integration} failed at ${landed.stage}: ${landed.reason}`;
+        updateTask(task.id, { status: TaskStatuses.waitingHuman, reason: reason.slice(0, 2000) });
+        audit("approval.signed", { taskId, approve, status: TaskStatuses.waitingHuman, landed: false, stage: landed.stage, files, record: signed });
+        bus.publish("approval.landing-failed", { taskId, integration, stage: landed.stage, reason: landed.reason, files });
+        return fail(409, reason, { code: "landing-failed", stage: landed.stage, files, record: signed });
+      }
+      landedSha = landed.mergedSha;
+    }
     const next: TaskStatus = approve ? TaskStatuses.done : TaskStatuses.failed;
     updateTask(task.id, {
       status: next,
-      reason: approve ? "approved by human (Ed25519)" : "rejected by human (Ed25519)",
+      reason: approve
+        ? landedSha !== undefined
+          ? `approved by human (Ed25519); landed ${landedSha.slice(0, 12)}`
+          : "approved by human (Ed25519)"
+        : "rejected by human (Ed25519)",
+      ...(landedSha !== undefined ? { landedSha } : {}),
     });
-    const signed = signedRecord(humanKey, payload, signatureHex as string);
-    audit("approval.signed", { taskId, approve, status: next, record: signed });
-    bus.publish("approval.signed", { taskId, status: next, approve, subjectHash: binding.subjectHash });
-    return json({ taskId, status: next, subjectHash: binding.subjectHash, record: signed }, 200);
+    audit("approval.signed", { taskId, approve, status: next, landedSha: landedSha ?? null, record: signed });
+    bus.publish("approval.signed", { taskId, status: next, approve, subjectHash: binding.subjectHash, landedSha: landedSha ?? null });
+    return json({ taskId, status: next, subjectHash: binding.subjectHash, landedSha: landedSha ?? null, record: signed }, 200);
+  }
+
+  /**
+   * Land an approved task onto its mission's integration branch, one
+   * landing at a time. Null when the task left `waitingHuman` while queued.
+   */
+  function landApproved(taskId: string, integration: string): Promise<LandResult | null> {
+    const run = async (): Promise<LandResult | null> => {
+      const task = tasks.get(taskId);
+      if (repoDir === undefined || stateDir === undefined || task === undefined || task.status !== TaskStatuses.waitingHuman) {
+        return null;
+      }
+      try {
+        return await landTask({
+          repoDir,
+          landingRoot: join(stateDir, "landing"),
+          taskId,
+          missionId: task.missionId,
+          taskBranch: task.branch,
+          integration,
+          base: task.input.base,
+          audit,
+        });
+      } catch (err) {
+        return { ok: false, reason: (err as Error).message, stage: "merge", rolledBack: false };
+      }
+    };
+    const result = landingQueue.then(run, run);
+    landingQueue = result.catch(() => null);
+    return result;
   }
 
   async function route(req: Request): Promise<Response> {
@@ -1129,18 +1279,7 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
     setTier: (tier: ModelTier) => {
       activeTier = tier;
     },
-    reportProviderFailure: (failure: ProviderFailure) => {
-      failures += 1;
-      const disposition = classifyProviderFailure(failure, failures, activeTier);
-      if (disposition.action === "route-fallback") {
-        activeTier = disposition.targetTier;
-        failures = 0;
-        bus.publish("tier.fallback", { targetTier: activeTier });
-      } else {
-        bus.publish("provider.retry", { action: disposition.action });
-      }
-      return { action: disposition.action };
-    },
+    reportProviderFailure,
     reportProviderSuccess: () => {
       failures = 0;
     },
