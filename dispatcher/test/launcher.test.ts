@@ -4,37 +4,24 @@
  * child process exactly like `opencode serve`.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseDirectorReply } from "../src/director.js";
 import { parseListeningUrl, parseSseFrame, spawnWorker } from "../src/opencode-client.js";
+import { FAKE, FAKE_COMMAND, FAKE_WORKERS, git, post, scratchRepo, until } from "./helpers.js";
 import { createServer, type CreateServerOptions, type FleetServer } from "../src/server.js";
 import { taskPrompt } from "../src/worker-launcher.js";
 import { runTurn, type WorkerConnection } from "../src/worker-session.js";
 
-const FAKE = join(import.meta.dir, "fixtures", "fake-opencode.ts");
-const FAKE_COMMAND = [process.execPath, FAKE, "serve", "--port", "0", "--hostname", "127.0.0.1"];
 
-function git(cwd: string, args: string[]): string {
-  return execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd, encoding: "utf8" }).trim();
-}
 
-function scratchRepo(): string {
-  const repo = mkdtempSync(join(tmpdir(), "launcher-repo-"));
-  git(repo, ["init", "-q", "-b", "main"]);
-  writeFileSync(join(repo, "README.md"), "# repo\n");
-  git(repo, ["add", "."]);
-  git(repo, ["commit", "-qm", "init"]);
-  return repo;
-}
 
 const opened: FleetServer[] = [];
 
 function server(options: CreateServerOptions): FleetServer {
   const app = createServer({
-    workers: { command: FAKE_COMMAND, startTimeoutMs: 15_000, taskTimeoutMs: 15_000 },
+    workers: FAKE_WORKERS,
     director: { command: FAKE_COMMAND, startTimeoutMs: 15_000, replyTimeoutMs: 15_000 },
     ...options,
   });
@@ -46,23 +33,7 @@ afterEach(async () => {
   await Promise.all(opened.splice(0).map((app) => app.shutdown()));
 });
 
-async function until(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) throw new Error("condition not reached in time");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
-function post(app: FleetServer, path: string, body: unknown): Promise<Response> {
-  return app.fetch(
-    new Request(`http://127.0.0.1${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-csrf-token": app.csrfToken },
-      body: JSON.stringify(body),
-    }),
-  );
-}
 
 describe("worker protocol helpers", () => {
   test("listening URL and SSE frame parsing", () => {

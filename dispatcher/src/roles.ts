@@ -62,7 +62,7 @@ function listSkills(opencodeDir: string): string[] {
       if (existsSync(file)) skills.push(file);
     }
   }
-  return skills.sort();
+  return skills.sort((a, b) => a.localeCompare(b));
 }
 
 function readMaxConcurrent(roleDir: string): number | undefined {

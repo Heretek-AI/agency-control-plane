@@ -5,39 +5,25 @@
  * Workers are the fake OpenCode v2 server spawned as a real child process.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseTierModels } from "../src/cli-args.js";
 import { sealHumanKey, signApprovalPayload, unsealHumanKey, type ApprovalPayload } from "../src/human-key.js";
 import { loadRole, stripFrontmatter } from "../src/roles.js";
+import { FAKE_WORKERS, git, tempDir, post, scratchRepo, until } from "./helpers.js";
 import { createServer, type CreateServerOptions, type FleetServer } from "../src/server.js";
 import { parseModelRef, taskPrompt } from "../src/worker-launcher.js";
 import { TaskSchema } from "../src/model.js";
 
-const FAKE = join(import.meta.dir, "fixtures", "fake-opencode.ts");
-const FAKE_COMMAND = [process.execPath, FAKE, "serve", "--port", "0", "--hostname", "127.0.0.1"];
 const PASSPHRASE = "lifecycle passphrase";
 
-function git(cwd: string, args: string[]): string {
-  return execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd, encoding: "utf8" }).trim();
-}
 
-function scratchRepo(): string {
-  const repo = mkdtempSync(join(tmpdir(), "lifecycle-repo-"));
-  git(repo, ["init", "-q", "-b", "main"]);
-  writeFileSync(join(repo, "README.md"), "# repo\n");
-  git(repo, ["add", "."]);
-  git(repo, ["commit", "-qm", "init"]);
-  return repo;
-}
 
 const opened: FleetServer[] = [];
 
 function server(options: CreateServerOptions): FleetServer {
   const app = createServer({
-    workers: { command: FAKE_COMMAND, startTimeoutMs: 15_000, taskTimeoutMs: 15_000 },
+    workers: FAKE_WORKERS,
     director: false,
     ...options,
   });
@@ -49,23 +35,7 @@ afterEach(async () => {
   await Promise.all(opened.splice(0).map((app) => app.shutdown()));
 });
 
-async function until(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) throw new Error("condition not reached in time");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
-function post(app: FleetServer, path: string, body: unknown): Promise<Response> {
-  return app.fetch(
-    new Request(`http://127.0.0.1${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-csrf-token": app.csrfToken },
-      body: JSON.stringify(body),
-    }),
-  );
-}
 
 async function approve(app: FleetServer, humanKey: Buffer, taskId: string): Promise<Response> {
   const minted = await post(app, `/api/approvals/${taskId}/ticket`, {});
@@ -78,7 +48,7 @@ async function approve(app: FleetServer, humanKey: Buffer, taskId: string): Prom
 }
 
 function keyedState(): { stateDir: string; humanKey: Buffer } {
-  const stateDir = mkdtempSync(join(tmpdir(), "lifecycle-state-"));
+  const stateDir = tempDir("lifecycle-state-");
   sealHumanKey(stateDir, PASSPHRASE);
   return { stateDir, humanKey: unsealHumanKey(stateDir, PASSPHRASE) };
 }
@@ -92,7 +62,7 @@ function readPrompts(file: string): Array<{ model: { providerID: string; id: str
 
 describe("approval lands the task (G-1) and releases its worktree (G-2)", () => {
   test("APPROVE merges fleet/<task> into the mission integration branch and records landedSha", async () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("lifecycle-repo-");
     const { stateDir, humanKey } = keyedState();
     const app = server({ repoDir: repo, stateDir });
     app.upsertTask({ id: "task-1", status: "pending", title: "Write output" });
@@ -117,7 +87,7 @@ describe("approval lands the task (G-1) and releases its worktree (G-2)", () => 
   });
 
   test("a landing conflict keeps the task waitingHuman with the conflicting files listed", async () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("lifecycle-repo-");
     const { stateDir, humanKey } = keyedState();
     const app = server({ repoDir: repo, stateDir });
     app.upsertTask({ id: "task-1", status: "pending", title: "Write output" });
@@ -148,7 +118,7 @@ describe("approval lands the task (G-1) and releases its worktree (G-2)", () => 
   });
 
   test("REJECT releases the worktree and salvages the branch", async () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("lifecycle-repo-");
     const { stateDir, humanKey } = keyedState();
     const app = server({ repoDir: repo, stateDir });
     app.upsertTask({ id: "task-1", status: "pending", title: "Write output" });
@@ -174,8 +144,8 @@ describe("approval lands the task (G-1) and releases its worktree (G-2)", () => 
 
 describe("terminal states release worktrees (G-2)", () => {
   test("no-change done and worker failure both release; failure salvages", async () => {
-    const repo = scratchRepo();
-    const stateDir = mkdtempSync(join(tmpdir(), "lifecycle-state-"));
+    const repo = scratchRepo("lifecycle-repo-");
+    const stateDir = tempDir("lifecycle-state-");
     const app = server({ repoDir: repo, stateDir });
     app.upsertTask({ id: "task-n", status: "pending", title: "nothing [noop]" });
     app.upsertTask({ id: "task-f", status: "pending", title: "explode [fail]" });
@@ -188,8 +158,8 @@ describe("terminal states release worktrees (G-2)", () => {
   });
 
   test("restart releases worktrees of tasks that finished before the crash", async () => {
-    const repo = scratchRepo();
-    const stateDir = mkdtempSync(join(tmpdir(), "lifecycle-state-"));
+    const repo = scratchRepo("lifecycle-repo-");
+    const stateDir = tempDir("lifecycle-state-");
     const first = server({ repoDir: repo, stateDir });
     first.upsertTask({ id: "task-1", status: "pending", title: "Write output" });
     await until(() => first.getTask("task-1")?.status === "waitingHuman" && first.runningWorkers().length === 0);
@@ -207,7 +177,7 @@ describe("terminal states release worktrees (G-2)", () => {
 });
 
 function rolePack(): string {
-  const roles = mkdtempSync(join(tmpdir(), "lifecycle-roles-"));
+  const roles = tempDir("lifecycle-roles-");
   const base = join(roles, "dba-specialist", "opencode");
   mkdirSync(join(base, "agent"), { recursive: true });
   mkdirSync(join(base, "skill", "postgres-migrations"), { recursive: true });
@@ -253,13 +223,13 @@ describe("role packs shape expert workers (G-3)", () => {
   });
 
   test("expert task: XDG_CONFIG_HOME, copied opencode.json, role prompt, per-role cap", async () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("lifecycle-repo-");
     const roles = rolePack();
-    const stateDir = mkdtempSync(join(tmpdir(), "lifecycle-state-"));
+    const stateDir = tempDir("lifecycle-state-");
     const app = server({
       repoDir: repo,
       stateDir,
-      workers: { command: FAKE_COMMAND, startTimeoutMs: 15_000, taskTimeoutMs: 15_000, rolesDir: roles },
+      workers: { ...FAKE_WORKERS, rolesDir: roles },
     });
     app.upsertTask({ id: "task-1", status: "pending", title: "slow [hang]", expert: "dba-specialist" });
     app.upsertTask({ id: "task-2", status: "pending", title: "second", expert: "dba-specialist" });
@@ -277,15 +247,13 @@ describe("role packs shape expert workers (G-3)", () => {
 
 describe("tier failover reaches the workers (G-4)", () => {
   test("a quota failure re-queues the task on the next tier's model without spending an attempt", async () => {
-    const repo = scratchRepo();
-    const stateDir = mkdtempSync(join(tmpdir(), "lifecycle-state-"));
+    const repo = scratchRepo("lifecycle-repo-");
+    const stateDir = tempDir("lifecycle-state-");
     const app = server({
       repoDir: repo,
       stateDir,
       workers: {
-        command: FAKE_COMMAND,
-        startTimeoutMs: 15_000,
-        taskTimeoutMs: 15_000,
+        ...FAKE_WORKERS,
         tierModels: { "tier-1-opencode": "opencode/quota-exhausted", "tier-2-commercial": "bifrost/backup-model" },
       },
     });
@@ -303,9 +271,9 @@ describe("tier failover reaches the workers (G-4)", () => {
   });
 
   test("quota on the last tier pauses launches instead of failing tasks", async () => {
-    const repo = scratchRepo();
-    const stateDir = mkdtempSync(join(tmpdir(), "lifecycle-state-"));
-    const app = server({ repoDir: repo, stateDir, workers: { command: FAKE_COMMAND, startTimeoutMs: 15_000, taskTimeoutMs: 15_000 } });
+    const repo = scratchRepo("lifecycle-repo-");
+    const stateDir = tempDir("lifecycle-state-");
+    const app = server({ repoDir: repo, stateDir, workers: FAKE_WORKERS });
     app.setTier("tier-3-local");
     const disposition = app.reportProviderFailure({ status: 402, code: "insufficient_quota", headers: { "retry-after": "60" } });
     expect(disposition.action).toBe("pause-missions");
