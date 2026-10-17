@@ -285,6 +285,21 @@ describe("tier failover reaches the workers (G-4)", () => {
     expect(app.getTask("task-1")?.reason).toContain("missions paused");
   });
 
+  test("quota reports from a tier already left behind do not skip tiers", () => {
+    const app = server({ workers: false });
+    const quota = { status: 402, code: "insufficient_quota" };
+    expect(app.reportProviderFailure(quota, "tier-1-opencode")).toEqual({ action: "route-fallback", targetTier: "tier-2-commercial" });
+    // A second worker that was also on tier 1 reports the same exhaustion.
+    expect(app.reportProviderFailure(quota, "tier-1-opencode")).toEqual({ action: "route-fallback", targetTier: "tier-2-commercial" });
+    expect(app.getBoard().activeTier).toBe("tier-2-commercial");
+  });
+
+  test("an invalid tier model fails at startup, not per task", () => {
+    expect(() =>
+      server({ repoDir: scratchRepo("lifecycle-repo-"), stateDir: tempDir("lifecycle-state-"), workers: { ...FAKE_WORKERS, tierModels: { "tier-1-opencode": "nomodel" } } }),
+    ).toThrow("invalid model reference");
+  });
+
   test("model references and --tier-models parse strictly", () => {
     expect(parseModelRef("bifrost/gpt-5#high")).toEqual({ providerID: "bifrost", id: "gpt-5", variant: "high" });
     expect(parseModelRef("opencode/glm-4.6")).toEqual({ providerID: "opencode", id: "glm-4.6" });

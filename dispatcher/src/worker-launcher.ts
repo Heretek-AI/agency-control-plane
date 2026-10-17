@@ -57,7 +57,7 @@ export interface LauncherHost {
   /** The model tier new sessions run on. */
   activeTier?: (() => ModelTier) | undefined;
   /** Tier failover: classify a provider failure and apply its disposition. */
-  reportProviderFailure?: ((failure: ProviderFailure) => ProviderDisposition) | undefined;
+  reportProviderFailure?: ((failure: ProviderFailure, sessionTier?: ModelTier) => ProviderDisposition) | undefined;
 }
 
 export interface WorkerLauncherOptions {
@@ -155,11 +155,17 @@ export class WorkerLauncher {
   private scheduled = false;
   private pausedUntilMs = 0;
   private resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Parsed `tierModels`, validated at construction so bad config fails at startup. */
+  private readonly tierModels = new Map<ModelTier, ModelRef>();
 
   constructor(
     private readonly host: LauncherHost,
     private readonly options: WorkerLauncherOptions,
-  ) {}
+  ) {
+    for (const [tier, model] of Object.entries(options.tierModels ?? {})) {
+      if (model !== undefined) this.tierModels.set(tier as ModelTier, parseModelRef(model));
+    }
+  }
 
   runningIds(): string[] {
     return [...this.active.keys()].sort();
@@ -305,7 +311,7 @@ export class WorkerLauncher {
     }
     const tier = this.host.activeTier?.();
     const modelName = tier === undefined ? undefined : this.options.tierModels?.[tier];
-    const model = modelName === undefined ? undefined : parseModelRef(modelName);
+    const model = tier === undefined ? undefined : this.tierModels.get(tier);
     this.host.updateTask(taskId, {
       worktree: dir,
       branch: `fleet/${taskId}`,
@@ -346,7 +352,7 @@ export class WorkerLauncher {
         onEvent: (event) => this.relay(taskId, event, toolNames, toolInputs),
       });
       if (result.outcome === "aborted") return;
-      if (result.outcome === "failed" && result.error !== undefined && this.requeueOnQuota(taskId, result.error) !== null) {
+      if (result.outcome === "failed" && result.error !== undefined && this.requeueOnQuota(taskId, result.error, tier) !== null) {
         return;
       }
       if (result.outcome !== "succeeded") {
@@ -404,12 +410,12 @@ export class WorkerLauncher {
    * queue without spending an attempt. Returns the applied disposition,
    * or null for any other error (the caller fails the task).
    */
-  private requeueOnQuota(taskId: string, error: string): ProviderDisposition | null {
+  private requeueOnQuota(taskId: string, error: string, sessionTier: ModelTier | undefined): ProviderDisposition | null {
     const failure: ProviderFailure = { message: error, code: error };
     if (this.host.reportProviderFailure === undefined || !isQuotaFailure(failure)) return null;
     const task = this.host.getTask(taskId);
     if (task === undefined || task.status !== "running") return null;
-    const disposition = this.host.reportProviderFailure(failure);
+    const disposition = this.host.reportProviderFailure(failure, sessionTier);
     const reason =
       disposition.action === "route-fallback"
         ? `provider quota exhausted; re-queued on ${disposition.targetTier}`

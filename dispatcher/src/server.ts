@@ -258,7 +258,8 @@ export interface FleetServer {
   getTask(id: string): Task | undefined;
   upsertTask(input: UpsertTaskInput): Task;
   setTier(tier: ModelTier): void;
-  reportProviderFailure(failure: ProviderFailure): ProviderDisposition;
+  /** `sessionTier`: the tier the failing session ran on; a failure from a tier already left behind changes nothing. */
+  reportProviderFailure(failure: ProviderFailure, sessionTier?: ModelTier): ProviderDisposition;
   reportProviderSuccess(): void;
   consecutiveFailures(): number;
   updateTask(id: string, patch: Partial<Task>): Task;
@@ -663,7 +664,11 @@ export function createServer(options: CreateServerOptions = {}): FleetServer {
     }
   }
 
-  function reportProviderFailure(failure: ProviderFailure): ProviderDisposition {
+  function reportProviderFailure(failure: ProviderFailure, sessionTier: ModelTier = activeTier): ProviderDisposition {
+    // Concurrent workers on the old tier report the same exhaustion: count it once.
+    if (sessionTier !== activeTier) {
+      return { action: "route-fallback", targetTier: activeTier };
+    }
     failures += 1;
     const disposition = classifyProviderFailure(failure, failures, activeTier);
     if (disposition.action === "route-fallback") {
