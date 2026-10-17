@@ -34,7 +34,7 @@ if grep -n -E 'record\["publicKey|passphraseToKeypair|verifyApprovalSignature' d
 fi
 
 echo "[wave-4] approval attacks, es-core key compatibility, launcher, Director, persistence, NATS"
-bun test dispatcher/test/approvals.test.ts dispatcher/test/human-key.test.ts dispatcher/test/launcher.test.ts dispatcher/test/nats-bridge.test.ts
+bun test dispatcher/test/approvals.test.ts dispatcher/test/human-key.test.ts dispatcher/test/launcher.test.ts dispatcher/test/nats-bridge.test.ts dispatcher/test/lifecycle.test.ts
 
 echo "[wave-4] browser build"
 bun run build:web

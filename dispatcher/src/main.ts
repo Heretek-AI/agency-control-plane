@@ -17,14 +17,18 @@
  *   --director-cmd <cmd>    Director server command (default: worker command)
  *   --director-agent <name> OpenCode agent for the Director (default `director`)
  *   --task-agent <name>     OpenCode agent for task workers (default: server default)
+ *   --roles-dir <dir>       role packs for `expert` tasks (FLEET_ROLES_DIR); see dispatcher/src/roles.ts
+ *   --tier-models <json>    `{"tier-1-opencode": "provider/model", ...}` (FLEET_TIER_MODELS);
+ *                           tier failover moves new worker sessions to the next tier's model
  *   --fleet-cap <n>         max concurrent workers (default 4)
+ *   --per-expert-cap <n>    max concurrent workers per expert without a role cap (default: fleet cap)
  *   --task-timeout-ms <n>   per-task worker timeout (default 30 min)
  *   --no-workers / --no-director
  *   NATS_URL                mirror events + board into NATS JetStream / KV
  */
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { parseArgs, parseCommand } from "./cli-args.js";
+import { parseArgs, parseCommand, parseTierModels } from "./cli-args.js";
 import { NatsJetStreamBridge, natsUrlFromEnv, redactNatsUrl } from "./nats-bridge.js";
 import { startServer } from "./server.js";
 
@@ -58,6 +62,9 @@ async function main(): Promise<void> {
       : {
           command: workerCommand,
           agent: flags.get("task-agent"),
+          rolesDir: flags.get("roles-dir") ?? env["FLEET_ROLES_DIR"],
+          tierModels: parseTierModels(flags.get("tier-models") ?? env["FLEET_TIER_MODELS"]),
+          perExpertCap: flags.has("per-expert-cap") ? Math.max(1, int(flags.get("per-expert-cap"), 1, "--per-expert-cap")) : undefined,
           taskTimeoutMs: flags.has("task-timeout-ms") ? int(flags.get("task-timeout-ms"), 0, "--task-timeout-ms") : undefined,
         },
     director: switches.has("no-director")

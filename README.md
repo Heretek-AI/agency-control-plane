@@ -42,6 +42,9 @@ Dispatcher flags (also documented in the header of `dispatcher/src/main.ts`):
 | `--director-agent` | `director` | OpenCode agent of the Director session (define it in your OpenCode config) |
 | `--task-agent` | server default | OpenCode agent for task sessions |
 | `--fleet-cap` | `4` | Max concurrent workers (scheduler cap) |
+| `--per-expert-cap` | fleet cap | Max concurrent workers per `expert` when its role pack sets no `maxConcurrent` |
+| `--roles-dir` / `FLEET_ROLES_DIR` | unset | Role packs for `expert` tasks (see **Role packs** below) |
+| `--tier-models` / `FLEET_TIER_MODELS` | unset | JSON `{"tier-1-opencode": "provider/model", "tier-2-commercial": …, "tier-3-local": …}`. New worker sessions run on the active tier's model; unset tiers use the worker's default model |
 | `--task-timeout-ms` | 30 min | Per-task worker timeout |
 | `--no-workers`, `--no-director` | | Disable the launcher / Director |
 | `NATS_URL` | unset | Mirror events + board into NATS JetStream / KV (start fails if set but unreachable) |
@@ -79,8 +82,12 @@ Dispatcher flags (also documented in the header of `dispatcher/src/main.ts`):
    exiting / timing out) ends the run. Successful runs are committed onto
    the task branch (never the `.opencode` state); a non-empty diff moves
    the card to **Waiting Approval / QA**, an empty one to **Done**.
-   Failures follow the task's retry policy. Shutdown (SIGINT/SIGTERM)
-   kills every worker and re-queues interrupted tasks.
+   Failures follow the task's retry policy, except quota-shaped provider
+   errors (`limits.ts`): those move the fleet to the next model tier and
+   re-queue the task without spending an attempt; quota on
+   `tier-3-local` holds new launches until the provider's retry time.
+   Shutdown (SIGINT/SIGTERM) kills every worker and re-queues
+   interrupted tasks.
 3. **Approval.** The human opens the card, checks the diff, and mints a
    ticket. The **server** computes `subjectHash = sha256(concatenated
    per-file patches of base...fleet/<task>)` and returns the exact
@@ -96,16 +103,47 @@ Dispatcher flags (also documented in the header of `dispatcher/src/main.ts`):
    sends only `{ ticket, approve, subjectHash, signatureHex }`. The
    dispatcher burns the single-use 60 s ticket, recomputes the diff hash,
    and verifies against the pinned `human.pub` only (any client key or
-   passphrase is ignored). APPROVE → `done`, REJECT → `failed`; the full
-   es-core-shaped signed record goes into the hash-chained audit ledger.
-4. **Persistence.** Tasks, missions, chat, counters and per-task tool
+   passphrase is ignored). APPROVE lands the task: `fleet/<task>` is
+   merged `--no-ff` into `fleet/integration/<mission>` in a throwaway
+   worktree (`landing.ts`), the task moves to `done` with its
+   `landedSha`. A merge conflict leaves the integration branch untouched
+   and the task in **Waiting Approval / QA** (409, conflicting files in
+   the response and the task reason); resolve on the task branch and
+   approve again. REJECT → `failed`. The full es-core-shaped signed
+   record goes into the hash-chained audit ledger.
+4. **Worktree release.** When a task reaches `done`, `failed`, or
+   `cancelled` and no worker runs in it, its worktree is removed (the
+   branch stays). Branches of `failed` / `cancelled` tasks are then
+   anchored at `refs/fleet-salvage/<task>` and deleted, so no work is
+   lost. A restart releases worktrees of tasks that finished while the
+   dispatcher was down.
+5. **Persistence.** Tasks, missions, chat, counters and per-task tool
    logs live in `<state-dir>/dispatcher.db`; a restart resumes the board
    (tasks that were running are re-queued).
-5. **NATS (optional).** With `NATS_URL`, every bus event is published to
+6. **NATS (optional).** With `NATS_URL`, every bus event is published to
    JetStream subject `fleet.events.<type>` on stream `FLEET_EVENTS`
    (drop-oldest at 10 000 messages) and every task document is mirrored to
    KV bucket `fleet-board` (`nats@2.29.3`). The in-process ring buffer
    remains the SSE source of truth.
+
+## Role packs (`--roles-dir`)
+
+A task's `expert` names a role pack at `<roles-dir>/<role-id>/`, laid out
+as an OpenCode config home:
+
+```text
+<roles-dir>/<role-id>/
+  role.json                       optional: {"maxConcurrent": 2}
+  opencode/opencode.json          copied (not symlinked) into the worktree .opencode/
+  opencode/agent/<role-id>.md     role prompt, frontmatter stripped, put in the task prompt
+  opencode/skill/<name>/SKILL.md  listed in the task prompt
+```
+
+The worker runs with `XDG_CONFIG_HOME=<roles-dir>/<role-id>`, so OpenCode
+also picks the role's agents and skills up as its global config.
+`agents/` and `skills/` work as plural aliases. Only slug role ids
+resolve; an `expert` without a pack runs with the generic prompt and a
+`role.missing` event.
 
 ## Control API (`dispatcher/src/server.ts`, Bun HTTP + SSE, `127.0.0.1` only)
 
@@ -115,7 +153,7 @@ Dispatcher flags (also documented in the header of `dispatcher/src/main.ts`):
 | `POST /api/director/message` | `/ship <spec>` → cards now (200); otherwise → Director turn (202; reply + cards arrive as `director.message`). 503 without a Director. |
 | `GET /api/tasks/:id/drilldown` | Session, stage gates, tool log, diff hunks, `subjectHash`. |
 | `POST /api/approvals/:taskId/ticket` | Single-use 60 s ticket; server-computed `subjectHash`, payloads to sign, pinned key fingerprint. 503 without a pinned key, 409 unless `waitingHuman`. |
-| `POST /api/approvals/:taskId/sign` | Burn ticket, re-hash diff, verify Ed25519 against the pinned key; `waitingHuman` → `done` / `failed`. |
+| `POST /api/approvals/:taskId/sign` | Burn ticket, re-hash diff, verify Ed25519 against the pinned key; APPROVE lands the task (`done` + `landedSha`, or 409 `landing-failed` with conflicting files and the task kept `waitingHuman`), REJECT → `failed`. |
 | `GET /api/events` | SSE (ring-buffered, `Last-Event-ID` replay, gap markers). |
 | `GET /api/csrf` | CSRF token for POSTs. |
 | `GET /*` | The built WebUI (`web/dist`) with a strict same-origin CSP. |
@@ -127,7 +165,7 @@ Dispatcher flags (also documented in the header of `dispatcher/src/main.ts`):
   `approval-tickets.ts`, `human-key.ts` (es-core-compatible pinned key),
   `board-store.ts` (SQLite board), `opencode-client.ts` (worker process +
   OpenCode v2 HTTP client behind `WorkerApi`), `worker-session.ts`,
-  `worker-launcher.ts`, `director.ts`, `nats-bridge.ts`, `server.ts`,
+  `worker-launcher.ts`, `roles.ts` (role packs), `director.ts`, `nats-bridge.ts`, `server.ts`,
   `main.ts` (daemon), `keygen.ts`.
 - `dispatcher/test/fixtures/fake-opencode.ts` — fake `opencode serve`
   implementing the routes above, used by the launcher/Director tests and

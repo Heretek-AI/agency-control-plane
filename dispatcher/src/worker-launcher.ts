@@ -12,21 +12,32 @@
  *   1. allocate (or reuse) its worktree via `worktrees.ts`, pinning the
  *      base commit so the approval diff is stable;
  *   2. spawn the worker command in the worktree with isolated
- *      `.opencode` state;
- *   3. create a session, send the task prompt, and republish tool /
+ *      `.opencode` state; an `expert` task with a role pack (`roles.ts`)
+ *      gets `XDG_CONFIG_HOME=<rolesDir>/<role>`, the role `opencode.json`
+ *      copied into its `.opencode/`, and the role prompt + skills in its
+ *      task prompt;
+ *   3. create a session on the active model tier's model (when
+ *      `tierModels` maps it), send the task prompt, and republish tool /
  *      status / text events on the dispatcher bus (drill-down live log);
  *   4. on success commit the worktree changes onto `fleet/<taskId>` and
  *      move the task to `waitingHuman` (non-empty diff: a human must sign
- *      it) or `done` (no changes); on failure / exit / timeout apply the
- *      task's retry policy (`nextStatus`).
+ *      it) or `done` (no changes); on a quota-shaped provider failure
+ *      report it to the tier failover and re-queue the task without
+ *      spending an attempt; on any other failure / exit / timeout apply
+ *      the task's retry policy (`nextStatus`).
+ *
+ * While missions are paused (last tier exhausted) nothing new launches
+ * until the provider's retry time.
  *
  * `stop()` aborts every run, kills every worker, and re-queues
  * interrupted tasks as `pending` so a restart resumes them.
  */
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { isQuotaFailure, type ModelTier, type ProviderDisposition, type ProviderFailure } from "./limits.js";
 import type { Task, TaskStatus } from "./model.js";
-import type { WorkerEvent } from "./opencode-client.js";
+import type { ModelRef, WorkerEvent } from "./opencode-client.js";
+import { installRoleConfig, loadRole, type RoleProfile } from "./roles.js";
 import { nextStatus, schedule, type ScheduleCaps } from "./scheduler.js";
 import { describeError, openWorker, runTurn, type WorkerClientFactory, type WorkerConnection } from "./worker-session.js";
 import { allocateWorktree, runGit, type WorktreeStore } from "./worktrees.js";
@@ -41,6 +52,12 @@ export interface LauncherHost {
   audit(event: string, data: unknown): void;
   /** Called after a run finishes and the task branch holds the worker's commit. */
   afterRun?: ((taskId: string) => void) | undefined;
+  /** Called once a run is fully over: worker killed, task no longer running here. */
+  onRunSettled?: ((taskId: string) => void) | undefined;
+  /** The model tier new sessions run on. */
+  activeTier?: (() => ModelTier) | undefined;
+  /** Tier failover: classify a provider failure and apply its disposition. */
+  reportProviderFailure?: ((failure: ProviderFailure, sessionTier?: ModelTier) => ProviderDisposition) | undefined;
 }
 
 export interface WorkerLauncherOptions {
@@ -51,6 +68,10 @@ export interface WorkerLauncherOptions {
   caps: ScheduleCaps;
   /** OpenCode agent for task sessions (omit for the server default). */
   agent?: string | undefined;
+  /** Role packs for `expert` tasks (see `roles.ts`). */
+  rolesDir?: string | undefined;
+  /** `provider/model` per tier; a mapped tier pins the session model. */
+  tierModels?: Partial<Record<ModelTier, string>> | undefined;
   startTimeoutMs?: number | undefined;
   taskTimeoutMs?: number | undefined;
   env?: Record<string, string | undefined> | undefined;
@@ -85,13 +106,32 @@ function contentText(content: unknown): string {
     .join("\n");
 }
 
-/** The prompt a task worker receives. */
-export function taskPrompt(task: Task): string {
+/** Parse a `provider/model[#variant]` reference into the OpenCode v2 `Model.Ref` shape. */
+export function parseModelRef(value: string): ModelRef {
+  const slash = value.indexOf("/");
+  const hash = value.indexOf("#", slash + 1);
+  const providerID = value.slice(0, Math.max(slash, 0));
+  const id = value.slice(slash + 1, hash === -1 ? undefined : hash);
+  const variant = hash === -1 ? undefined : value.slice(hash + 1);
+  if (slash <= 0 || id.length === 0 || providerID.includes("#") || variant === "") {
+    throw new Error(`invalid model reference ${JSON.stringify(value)} (want provider/model)`);
+  }
+  return variant === undefined ? { providerID, id } : { providerID, id, variant };
+}
+
+/** The prompt a task worker receives, shaped by its role pack when it has one. */
+export function taskPrompt(task: Task, role?: RoleProfile): string {
   const lines = [
     `You are a fleet worker for task ${task.id}${task.title !== undefined ? `: ${task.title}` : ""}.`,
-    "",
-    `Objective: ${task.input.objective}`,
   ];
+  if (role !== undefined) {
+    lines.push("", `Role: ${role.id}`);
+    if (role.prompt !== undefined) lines.push("", role.prompt);
+    if (role.skills.length > 0) {
+      lines.push("", "Role skills (read the SKILL.md that fits before starting):", ...role.skills.map((file) => `- ${file}`));
+    }
+  }
+  lines.push("", `Objective: ${task.input.objective}`);
   if (task.input.context !== undefined) lines.push("", `Context: ${task.input.context}`);
   if (task.input.constraints !== undefined) lines.push("", `Constraints: ${task.input.constraints}`);
   if (task.input.acceptance.length > 0) {
@@ -113,14 +153,66 @@ export class WorkerLauncher {
   private readonly active = new Map<string, ActiveRun>();
   private stopping = false;
   private scheduled = false;
+  private pausedUntilMs = 0;
+  private resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Parsed `tierModels`, validated at construction so bad config fails at startup. */
+  private readonly tierModels = new Map<ModelTier, ModelRef>();
 
   constructor(
     private readonly host: LauncherHost,
     private readonly options: WorkerLauncherOptions,
-  ) {}
+  ) {
+    for (const [tier, model] of Object.entries(options.tierModels ?? {})) {
+      if (model !== undefined) this.tierModels.set(tier as ModelTier, parseModelRef(model));
+    }
+  }
 
   runningIds(): string[] {
     return [...this.active.keys()].sort();
+  }
+
+  /** Hold every new launch until `untilMs` (epoch ms); running workers continue. */
+  pauseUntil(untilMs: number): void {
+    if (untilMs <= this.pausedUntilMs) return;
+    this.pausedUntilMs = untilMs;
+    if (this.resumeTimer !== null) clearTimeout(this.resumeTimer);
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = null;
+      this.kick();
+    }, Math.max(0, untilMs - Date.now()));
+  }
+
+  /** Epoch ms until which launches are held, or 0. */
+  pausedUntil(): number {
+    return this.pausedUntilMs > Date.now() ? this.pausedUntilMs : 0;
+  }
+
+  private roleFor(expert: string | undefined): RoleProfile | undefined {
+    if (expert === undefined || this.options.rolesDir === undefined) return undefined;
+    return loadRole(this.options.rolesDir, expert);
+  }
+
+  /** Scheduler caps with per-role `maxConcurrent` taking precedence over the configured per-expert cap. */
+  private capsForTick(): ScheduleCaps {
+    const base = this.options.caps;
+    if (this.options.rolesDir === undefined) return base;
+    const cache = new Map<string, number | undefined>();
+    return {
+      ...base,
+      perExpert: (expert: string) => {
+        if (!cache.has(expert)) {
+          let cap: number | undefined;
+          try {
+            cap = this.roleFor(expert)?.maxConcurrent;
+          } catch (err) {
+            this.host.publish("role.invalid", { role: expert, error: (err as Error).message });
+            cap = undefined;
+          }
+          cache.set(expert, cap);
+        }
+        return cache.get(expert) ?? base.perExpert?.(expert) ?? base.fleet;
+      },
+    };
   }
 
   /** Re-run scheduling soon (coalesced). Safe to call from any board mutation. */
@@ -136,7 +228,7 @@ export class WorkerLauncher {
   private tick(): void {
     if (this.stopping) return;
     const tasks = this.host.listTasks();
-    const plan = schedule(tasks, this.active.keys(), this.options.caps);
+    const plan = schedule(tasks, this.active.keys(), this.capsForTick());
     for (const id of plan.cancel) {
       this.host.updateTask(id, { status: "cancelled", reason: "a dependency can never succeed" });
     }
@@ -146,11 +238,18 @@ export class WorkerLauncher {
         this.host.updateTask(id, { status: "ready" });
       }
     }
+    const paused = this.pausedUntil() > 0;
     for (const id of plan.start) {
       const task = this.host.getTask(id);
       if (task === undefined) continue;
       if (task.kind === "human") {
         this.host.updateTask(id, { status: "waitingHuman", reason: "human gate" });
+        continue;
+      }
+      if (paused) {
+        if (task.status === "pending" || task.status === "backlog") {
+          this.host.updateTask(id, { status: "ready", reason: "missions paused: model quota exhausted on every tier" });
+        }
         continue;
       }
       this.launch(task);
@@ -168,6 +267,7 @@ export class WorkerLauncher {
       })
       .finally(() => {
         this.active.delete(task.id);
+        this.host.onRunSettled?.(task.id);
         this.kick();
       });
   }
@@ -196,6 +296,22 @@ export class WorkerLauncher {
     const task = this.host.getTask(taskId);
     if (task === undefined) return;
     const { dir, base } = this.ensureWorktree(task);
+    let role: RoleProfile | undefined;
+    try {
+      role = this.roleFor(task.expert);
+    } catch (err) {
+      this.finish(taskId, "failure", (err as Error).message);
+      return;
+    }
+    if (role !== undefined) {
+      installRoleConfig(role, dir);
+      this.host.audit("worker.role", { taskId, role: role.id, skills: role.skills.length, config: role.configFile !== undefined });
+    } else if (task.expert !== undefined && this.options.rolesDir !== undefined) {
+      this.host.publish("role.missing", { taskId, role: task.expert });
+    }
+    const tier = this.host.activeTier?.();
+    const modelName = tier === undefined ? undefined : this.options.tierModels?.[tier];
+    const model = tier === undefined ? undefined : this.tierModels.get(tier);
     this.host.updateTask(taskId, {
       worktree: dir,
       branch: `fleet/${taskId}`,
@@ -211,7 +327,7 @@ export class WorkerLauncher {
       command: this.options.command,
       cwd: dir,
       stateDir: path.join(dir, ".opencode"),
-      env: this.options.env,
+      env: role === undefined ? this.options.env : { ...this.options.env, XDG_CONFIG_HOME: role.dir },
       startTimeoutMs: this.options.startTimeoutMs,
       clientFactory: this.options.clientFactory,
     });
@@ -223,18 +339,22 @@ export class WorkerLauncher {
         directory: dir,
         agent: this.options.agent,
         title: current.title ?? taskId,
+        model,
       });
       this.host.updateTask(taskId, { sessionId: session.id, reason: "worker running" });
-      this.host.publish("worker.started", { taskId, sessionId: session.id, pid: conn.proc.pid });
-      this.host.audit("worker.started", { taskId, sessionId: session.id, command: this.options.command[0] });
+      this.host.publish("worker.started", { taskId, sessionId: session.id, pid: conn.proc.pid, tier: tier ?? null, model: modelName ?? null });
+      this.host.audit("worker.started", { taskId, sessionId: session.id, command: this.options.command[0], tier: tier ?? null, model: modelName ?? null });
       const toolNames = new Map<string, string>();
       const toolInputs = new Map<string, string>();
-      const result = await runTurn(conn, session.id, taskPrompt(current), {
+      const result = await runTurn(conn, session.id, taskPrompt(current, role), {
         timeoutMs: this.options.taskTimeoutMs ?? 30 * 60_000,
         signal: run.abort.signal,
         onEvent: (event) => this.relay(taskId, event, toolNames, toolInputs),
       });
       if (result.outcome === "aborted") return;
+      if (result.outcome === "failed" && result.error !== undefined && this.requeueOnQuota(taskId, result.error, tier) !== null) {
+        return;
+      }
       if (result.outcome !== "succeeded") {
         this.finish(taskId, "failure", result.error ?? result.outcome);
         return;
@@ -282,6 +402,35 @@ export class WorkerLauncher {
       default:
         break;
     }
+  }
+
+  /**
+   * A quota-shaped provider failure is the model tier's fault, not the
+   * task's: report it to the tier failover and put the task back in the
+   * queue without spending an attempt. Returns the applied disposition,
+   * or null for any other error (the caller fails the task).
+   */
+  private requeueOnQuota(taskId: string, error: string, sessionTier: ModelTier | undefined): ProviderDisposition | null {
+    const failure: ProviderFailure = { message: error, code: error };
+    if (this.host.reportProviderFailure === undefined || !isQuotaFailure(failure)) return null;
+    const task = this.host.getTask(taskId);
+    if (task === undefined || task.status !== "running") return null;
+    const disposition = this.host.reportProviderFailure(failure, sessionTier);
+    const reason =
+      disposition.action === "route-fallback"
+        ? `provider quota exhausted; re-queued on ${disposition.targetTier}`
+        : disposition.action === "pause-missions"
+          ? `provider quota exhausted on every tier; re-queued until missions resume`
+          : `provider quota error; re-queued`;
+    this.host.setStageGates(taskId, [
+      { name: "precheck", status: "pass" },
+      { name: "worker", status: "pending" },
+      { name: "verify", status: "pending" },
+    ]);
+    this.host.updateTask(taskId, { status: "pending", attempts: Math.max(0, task.attempts - 1), reason });
+    this.host.publish("worker.requeued", { taskId, reason, action: disposition.action });
+    this.host.audit("worker.requeued", { taskId, error: clip(error), action: disposition.action });
+    return disposition;
   }
 
   /** Commit worktree changes (never the isolated `.opencode` state) onto the task branch. */
@@ -344,6 +493,8 @@ export class WorkerLauncher {
   /** Abort every run, kill every worker, re-queue interrupted tasks. */
   async stop(): Promise<void> {
     this.stopping = true;
+    if (this.resumeTimer !== null) clearTimeout(this.resumeTimer);
+    this.resumeTimer = null;
     const runs = [...this.active.entries()];
     for (const [, run] of runs) run.abort.abort();
     await Promise.all(runs.map(async ([, run]) => run.conn?.close()));
